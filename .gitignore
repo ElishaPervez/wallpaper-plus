@@ -1,0 +1,9 @@
+# Build output (recreated by build.bat)
+/build/
+
+# Large local test videos
+/test-media/
+
+# Python cache
+__pycache__/
+*.pyc
