@@ -78,6 +78,7 @@ button { cursor: pointer; }
     linear-gradient(to bottom, transparent 30%, rgba(11, 12, 15, 0.8));
 }
 body[data-view="library"] .ambient,
+body[data-view="browse"] .ambient,
 body[data-view="settings"] .ambient { opacity: 0.45; transition: opacity 500ms ease; }
 
 /* ---------- top bar (also the window's title bar) ---------- */
@@ -472,6 +473,79 @@ body[data-maximized] .resize-edges { display: none; }
 .empty__title { margin: 0 0 8px; font: 700 26px/1 var(--display); text-transform: uppercase; letter-spacing: 0.04em; }
 .empty__text { margin: 0 0 22px; max-width: 420px; color: var(--muted); }
 .empty__actions { display: flex; gap: 10px; }
+
+/* ---------- browse ---------- */
+
+#view-browse { padding: 26px 32px 40px; }
+.search--wide { min-width: 320px; }
+.size-control { display: flex; align-items: center; gap: 10px; margin-right: 8px; color: var(--muted); }
+.size-control svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.5; flex: none; }
+.size-control .range { width: 140px; }
+.size-control__value { width: 14px; text-align: right; color: var(--text); }
+#web-grid { grid-template-columns: repeat(var(--cols, 4), minmax(0, 1fr)); }
+.topics { display: flex; flex-wrap: wrap; gap: 8px; margin: -6px 0 22px; }
+.topic {
+  padding: 6px 14px; border-radius: 999px;
+  border: 1px solid var(--line-strong); background: rgba(0, 0, 0, 0.25);
+  color: var(--muted); font-weight: 600; font-size: 13px;
+  transition: color 120ms, background 120ms, border-color 120ms;
+}
+.topic:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
+.topic[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: var(--on-accent); }
+
+.webcard__thumb, .webcard__video { opacity: 0; transition: opacity 350ms ease; }
+.webcard__thumb.is-on, .webcard__video.is-on { opacity: 1; }
+.webcard__tag {
+  position: absolute; left: 8px; top: 8px; z-index: 1;
+  padding: 2px 7px; border-radius: 6px;
+  background: rgba(8, 9, 12, 0.8); /* no blur: dozens of blurred badges redraw on every frame */
+  color: var(--text); font-size: 11px; font-weight: 700;
+}
+.webcard__state { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
+.webcard__state > * { pointer-events: auto; }
+.webcard__owned {
+  position: absolute; left: 44px; top: 8px;
+  padding: 2px 8px; border-radius: 6px;
+  background: var(--accent); color: var(--on-accent); font-size: 11px; font-weight: 700;
+}
+.webcard__actions {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  display: flex; gap: 8px; padding: 26px 10px 10px;
+  background: linear-gradient(transparent, rgba(5, 6, 8, 0.88));
+  opacity: 0; transform: translateY(6px);
+  transition: opacity 160ms, transform 180ms var(--ease);
+}
+.webcard__actions .btn { padding: 6px 12px; font-size: 13px; }
+.webcard__actions .btn:not(.btn--primary) { background: rgba(20, 22, 28, 0.88); }
+.card--web.is-fetching .card__media::after { /* the hovered clip is on its way */
+  content: ""; position: absolute; right: 46px; top: 13px; z-index: 2;
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.25); border-top-color: var(--accent);
+  animation: spin 800ms linear infinite;
+}
+.card--web:hover .webcard__actions, .card--web:focus-within .webcard__actions { opacity: 1; transform: none; }
+.webcard__progress {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  display: flex; align-items: center; gap: 8px; padding: 8px 8px 12px 12px;
+  background: linear-gradient(transparent, rgba(5, 6, 8, 0.9));
+  font-weight: 700; font-size: 12px;
+}
+.webcard__progress span { flex: 1; }
+.webcard__progress .icon-btn { width: 24px; height: 24px; font-size: 12px; }
+.webcard__progress::after { /* the bar, along the card's bottom edge */
+  content: ""; position: absolute; left: 0; bottom: 0; height: 3px;
+  width: var(--p, 0%); background: var(--accent); box-shadow: 0 0 10px var(--accent);
+  transition: width 200ms linear;
+}
+
+.web-foot { display: grid; justify-items: center; gap: 12px; padding: 34px 0 10px; color: var(--muted); text-align: center; }
+.web-foot p { margin: 0; }
+.web-foot__spin {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 2.5px solid var(--line-strong); border-top-color: var(--accent);
+  animation: spin 800ms linear infinite; /* only exists while a page is loading */
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------- settings ---------- */
 

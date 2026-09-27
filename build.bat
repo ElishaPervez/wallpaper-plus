@@ -26,7 +26,7 @@ echo === settings ===
 cl %CFLAGS% /Ithird_party /Ithird_party\webview2\build\native\include /bigobj ^
    src\settings\*.cpp src\common\*.cpp /Fobuild\obj\settings\ /Fe:build\WallpaperPlusSettings.exe build\obj\app.res ^
    /link %LFLAGS% third_party\webview2\build\native\x64\WebView2LoaderStatic.lib ^
-   user32.lib shell32.lib gdi32.lib ole32.lib oleaut32.lib advapi32.lib dwmapi.lib shlwapi.lib crypt32.lib version.lib ^
+   user32.lib shell32.lib gdi32.lib ole32.lib oleaut32.lib advapi32.lib dwmapi.lib shlwapi.lib crypt32.lib version.lib winhttp.lib ^
    || exit /b 1
 if exist build\ui rmdir /s /q build\ui
 xcopy /e /i /q ui build\ui >nul || exit /b 1

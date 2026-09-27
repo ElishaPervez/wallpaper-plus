@@ -72,6 +72,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == kToggleMaximize) ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
             if (wp == kClose) PostMessageW(hwnd, WM_CLOSE, 0, 0);
             return 0;
+        case WM_APP_BRIDGE:
+            g_bridge.Deliver(lp);
+            return 0;
         case WM_ACTIVATE:
             g_bridge.SendWindowState();
             break;

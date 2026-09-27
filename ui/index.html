@@ -22,6 +22,7 @@
     <nav class="tabs" role="tablist" aria-label="Sections">
       <button class="tab" role="tab" data-view="monitors">Monitors</button>
       <button class="tab" role="tab" data-view="library">Library</button>
+      <button class="tab" role="tab" data-view="browse">Browse</button>
       <button class="tab" role="tab" data-view="settings">Settings</button>
     </nav>
     <button class="status" id="status" data-action="status"></button>
@@ -77,6 +78,25 @@
           <button class="btn btn--primary" data-action="add-videos">Add videos</button>
         </div>
       </div>
+    </section>
+
+    <section class="view" id="view-browse" data-view="browse" hidden>
+      <div class="toolbar">
+        <h1 class="title">Browse</h1>
+        <div class="toolbar__spacer"></div>
+        <label class="size-control" title="Wallpapers per row">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="4" width="6" height="5" rx="1"/><rect x="11" y="4" width="6" height="5" rx="1"/><rect x="3" y="11" width="6" height="5" rx="1"/><rect x="11" y="11" width="6" height="5" rx="1"/></svg>
+          <input id="web-cols" class="range" type="range" min="2" max="8" step="1" aria-label="Wallpapers per row">
+          <span class="size-control__value mono" id="web-cols-value"></span>
+        </label>
+        <label class="search search--wide">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5"/><path d="M13.2 13.2 17 17"/></svg>
+          <input id="web-search" type="search" placeholder="Search wallpapers" aria-label="Search wallpapers" spellcheck="false">
+        </label>
+      </div>
+      <div class="topics" id="web-topics" role="group" aria-label="Topics"></div>
+      <div class="grid" id="web-grid"></div>
+      <div class="web-foot" id="web-foot"></div>
     </section>
 
     <section class="view" id="view-settings" data-view="settings" hidden></section>

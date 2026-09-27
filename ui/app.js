@@ -59,7 +59,7 @@ document.addEventListener('pointerdown', (e) => {
 const state = {
   monitors: [],
   config: null,
-  library: { version: 1, folders: [], items: [] },
+  library: { version: 1, folders: [], items: [], excluded: [] },
   selected: 1,
   view: 'monitors',
   playerRunning: true,
@@ -82,6 +82,8 @@ function hashId(text) {
 const keyOf = (path) => path.toLowerCase();
 const baseName = (path) => path.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
 const itemByPath = (path) => state.library.items.find((i) => keyOf(i.path) === keyOf(path));
+const isInside = (path, folder) => keyOf(path).startsWith(keyOf(folder).replace(/[\\/]+$/, '') + '\\');
+const isExcluded = (path) => state.library.excluded.includes(keyOf(path));
 const monitorByNumber = (n) => state.monitors.find((m) => m.number === n);
 
 function fmtDuration(sec) {
@@ -123,7 +125,7 @@ function saveConfig() {
 function saveLibrary() {
   clearTimeout(libraryTimer);
   libraryTimer = setTimeout(() => {
-    const clean = { version: 1, folders: state.library.folders, items: state.library.items.map(({ missing, failed, ...keep }) => keep) };
+    const clean = { version: 1, folders: state.library.folders, excluded: state.library.excluded, items: state.library.items.map(({ missing, failed, ...keep }) => keep) };
     rpc('saveLibrary', { library: clean }).catch((e) => toast(e.message));
   }, 300);
 }
@@ -138,9 +140,12 @@ async function urlFor(path) {
 
 // ---------- library ----------
 
-function addPaths(paths) {
+// Folder scans skip videos the user removed; adding a video by hand brings it back.
+function addPaths(paths, { fromFolderScan = false } = {}) {
   let added = 0;
   for (const path of paths) {
+    if (fromFolderScan && isExcluded(path)) continue;
+    state.library.excluded = state.library.excluded.filter((k) => k !== keyOf(path));
     if (itemByPath(path)) continue;
     state.library.items.push({ id: hashId(keyOf(path)), path, name: baseName(path), added: Date.now() + added });
     added++;
@@ -158,7 +163,7 @@ async function refreshLibraryFiles() {
     const exists = await rpc('statFiles', { paths: items.map((i) => i.path) });
     items.forEach((item, i) => { item.missing = !exists[i]; });
   }
-  if (state.library.folders.length) addPaths(await rpc('scanFolders', { folders: state.library.folders }));
+  if (state.library.folders.length) addPaths(await rpc('scanFolders', { folders: state.library.folders }), { fromFolderScan: true });
 }
 
 // Thumbnails are captured here from the video itself and stored by the host as small JPEGs.
@@ -288,6 +293,7 @@ function render() {
   renderStatus();
   if (state.view === 'monitors') { renderStage(); renderInspector(); }
   if (state.view === 'library') renderLibrary();
+  if (state.view === 'browse') renderBrowse();
   if (state.view === 'settings') renderSettings();
   setAmbient();
 }
@@ -593,6 +599,377 @@ function applyFromLibrary(item, monitor = state.selected, mode = 'replace') {
   }
 }
 
+// ---------- rendering: browse (motionbgs.com) ----------
+// The page never goes online itself (the host refuses every outside request). The host fetches
+// listing pages as text, and thumbnails and preview clips into a local cache; this code reads the
+// listings and lays them out. A card's preview clip is fetched and looped only while the pointer
+// rests on it; moving away tears the video down again.
+
+const SITE = 'https://motionbgs.com';
+const TOPICS = [
+  ['Latest', '/'], ['4K', '/4k/'], ['Anime', '/tag:anime/'], ['Games', '/tag:games/'], ['Nature', '/tag:nature/'],
+  ['Cars', '/tag:car/'], ['Space', '/tag:space/'], ['Rain', '/tag:rain/'], ['Night', '/tag:night/'],
+  ['Cyberpunk', '/tag:cyberpunk/'], ['Fantasy', '/tag:fantasy/'], ['Superhero', '/tag:superhero/'],
+  ['Japan', '/tag:japan/'], ['Animals', '/tag:animal/'], ['Dark', '/tag:dark/'],
+];
+const browse = {
+  topic: '/',           // chosen topic's page
+  query: '',            // search text; while set it replaces the topic
+  base: '/',            // numbered pages hang off this ('/tag:rain/' -> '/tag:rain/2/'); null = one page only
+  page: 0,              // pages loaded so far
+  next: '/',            // next page to load, or null at the end
+  items: [],
+  byId: new Map(),
+  loading: false,
+  error: '',
+  empty: '',
+  gen: 0,               // bumps with every new list; replies meant for an older list are dropped
+  started: false,
+  downloads: new Map(), // wallpaper id -> { quality, received, total }
+};
+const webMediaUrls = new Map(); // site path -> promise of the cached copy's URL
+let webSearchTimer = 0;
+let browseCols = clamp(Number(localStorage.getItem('browseColumns')) || 4, 2, 8); // cards per row
+
+// 4K when any screen is bigger than 1080p and the wallpaper has it.
+const wantsUhd = () => state.monitors.some((m) => m.width > 1920 || m.height > 1080);
+const bestQuality = (w) => (w.has4k && wantsUhd() ? '4k' : 'hd');
+const ownedWeb = (id) => state.library.items.find((i) => i.source?.site === 'motionbgs' && i.source.id === id && !i.missing);
+
+// Listing cards look like <a title="… live wallpaper" href=/slug><img src=/i/c/364x205/media/10050/galaxy-eyes.3840x2160.jpg>
+// … <span class=ttl>Galaxy Eyes</span><span class=frm>4K</span></a>. The number in the image path
+// is also the download number, and the preview clip sits at /media/<number>/<name>.960x540.mp4.
+function parseListing(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const items = [];
+  for (const a of doc.querySelectorAll('a[href][title$=" live wallpaper"]')) {
+    const m = a.querySelector('img')?.getAttribute('src')?.match(/^\/i\/c\/(\d+)x\d+\/media\/(\d+)\/([\w.-]+?)(\.\d+x\d+)?\.jpg$/);
+    if (!m || Number(m[1]) < 200) continue; // tiny menu icons, not listing cards
+    const [, , id, name, res = ''] = m;
+    items.push({
+      id,
+      page: a.getAttribute('href'),
+      title: (a.querySelector('.ttl')?.textContent || a.title.replace(/ live wallpaper$/, '')).trim(),
+      thumbFile: `${id}/${name}${res}.jpg`,
+      preview: `/media/${id}/${name}.960x540.mp4`,
+      has4k: /4k/i.test(a.querySelector('.frm')?.textContent || ''),
+    });
+  }
+  return { doc, items };
+}
+
+// Requests of the current list share the group "b<gen>"; a card's preview clip gets its own
+// subgroup so it can be called off alone when the pointer leaves before it downloads. Urgent
+// requests (the clip being hovered) jump ahead of queued thumbnails.
+function webMedia(path, group = `b${browse.gen}`, urgent = false) {
+  if (!webMediaUrls.has(path)) {
+    const url = rpc('web.media', { path, group, urgent });
+    webMediaUrls.set(path, url);
+    url.catch(() => webMediaUrls.delete(path)); // try again next time it's needed
+  }
+  return webMediaUrls.get(path);
+}
+
+function renderBrowse() {
+  if (!browse.started) {
+    browse.started = true;
+    browseReset();
+  } else {
+    for (const card of document.querySelectorAll('.card--web')) refreshWebCard(card.dataset.webId);
+  }
+}
+
+function renderTopics() {
+  $('#web-topics').innerHTML = TOPICS.map(([label, path]) =>
+    `<button class="topic" data-action="web-topic" data-path="${esc(path)}" aria-pressed="${!browse.query && browse.topic === path}">${esc(label)}</button>`).join('');
+}
+
+// Starts a fresh list for the current topic or search.
+function browseReset() {
+  rpc('web.cancel', { group: `b${browse.gen}` }).catch(() => {});
+  browse.gen++;
+  Object.assign(browse, { items: [], page: 0, loading: false, error: '', empty: '' });
+  browse.byId.clear();
+  browse.base = browse.query ? null : browse.topic;
+  browse.next = browse.query ? `/search?q=${encodeURIComponent(browse.query)}` : browse.topic;
+  const grid = $('#web-grid');
+  for (const video of grid.querySelectorAll('video')) stopVideo(video);
+  cardObserver.disconnect();
+  grid.innerHTML = '';
+  $('#view-browse').scrollTop = 0;
+  renderTopics();
+  browseMore();
+}
+
+async function browseMore() {
+  if (browse.loading || !browse.next) return;
+  const gen = browse.gen, path = browse.next;
+  browse.loading = true;
+  browse.error = '';
+  renderWebFoot();
+  try {
+    const res = await rpc('web.page', { path });
+    if (gen !== browse.gen) return;
+    const first = browse.page === 0;
+    if (res.status === 404 && !first) { browse.next = null; return; } // walked past the last page
+    if (res.status !== 200) throw new Error(`Couldn't load wallpapers (error ${res.status})`);
+    const { doc, items } = parseListing(res.html);
+    // A search that names a topic ("rain") lands on that topic's page, which has more pages.
+    if (first && browse.query && /^\/tag:[^/]+\/$/.test(res.url)) browse.base = res.url;
+    browse.page++;
+    const nextPath = browse.base && `${browse.base}${browse.page + 1}/`;
+    browse.next = nextPath && doc.querySelector(`a[href="${nextPath}"]`) ? nextPath : null;
+    const fresh = items.filter((w) => !browse.byId.has(w.id));
+    for (const w of fresh) { browse.byId.set(w.id, w); browse.items.push(w); }
+    if (first && !browse.items.length) {
+      browse.empty = browse.query && /no results/i.test(doc.querySelector('h1')?.textContent || '')
+        ? `No wallpapers match “${browse.query}”.`
+        : "Couldn't read this list of wallpapers. The site they come from may have changed its layout.";
+    }
+    appendWebCards(fresh);
+  } catch (e) {
+    if (gen === browse.gen) browse.error = e.message;
+  } finally {
+    if (gen === browse.gen) { browse.loading = false; renderWebFoot(); }
+  }
+}
+
+// Loads the next page once the bottom of the list comes within a screen or so.
+function maybeMoreWeb() {
+  const view = $('#view-browse');
+  if (state.view === 'browse' && view.scrollHeight - view.scrollTop - view.clientHeight < 900) browseMore();
+}
+
+function renderWebFoot() {
+  const foot = $('#web-foot');
+  if (browse.loading) foot.innerHTML = '<div class="web-foot__spin" role="status" aria-label="Loading"></div>';
+  else if (browse.error) foot.innerHTML = `<p>${esc(browse.error)}</p><button class="btn" data-action="web-retry">Try again</button>`;
+  else if (browse.empty) foot.innerHTML = `<p>${esc(browse.empty)}</p>`;
+  else if (!browse.next && browse.items.length) foot.innerHTML = `<p class="mono">${browse.items.length} wallpaper${browse.items.length === 1 ? '' : 's'} · end of the list</p>`;
+  else foot.innerHTML = '';
+  if (!browse.loading && browse.next && !browse.error) requestAnimationFrame(maybeMoreWeb);
+}
+
+function webStateHtml(w) {
+  const dl = browse.downloads.get(w.id);
+  if (dl) {
+    return `<div class="webcard__progress" style="--p:${dl.total ? (dl.received / dl.total) * 100 : 0}%">
+        <span class="mono">${webProgressText(dl)}</span>
+        <button class="icon-btn" data-action="web-cancel" data-web-id="${w.id}" aria-label="Cancel download" title="Cancel download">✕</button>
+      </div>`;
+  }
+  if (ownedWeb(w.id)) {
+    return `<span class="webcard__owned">In library</span>
+      <div class="webcard__actions"><button class="btn btn--primary" data-action="web-apply" data-web-id="${w.id}">Set on monitor ${state.selected}</button></div>`;
+  }
+  const best = bestQuality(w);
+  const get = (q) => `<button class="btn${q === best ? ' btn--primary' : ''}" data-action="web-get" data-web-id="${w.id}" data-quality="${q}">Get ${q.toUpperCase()}</button>`;
+  return `<div class="webcard__actions">${w.has4k ? get('4k') + get('hd') : get('hd')}</div>`;
+}
+function webProgressText(dl) {
+  if (dl.total) return `${Math.floor((dl.received / dl.total) * 100)}%`;
+  return dl.received ? `${(dl.received / 1048576).toFixed(1)} MB` : 'Waiting…';
+}
+
+function webCardHtml(w) {
+  return `
+    <article class="card card--web" data-web-id="${w.id}" tabindex="0" aria-label="${esc(w.title)}">
+      <div class="card__media">
+        <div class="card__placeholder"></div>
+        <span class="webcard__tag mono">${w.has4k ? '4K' : 'HD'}</span>
+        <div class="webcard__state">${webStateHtml(w)}</div>
+        <button class="card__more" data-action="web-menu" data-web-id="${w.id}" aria-label="More options" title="More options">⋯</button>
+      </div>
+      <div class="card__meta"><div class="card__name" title="${esc(w.title)}">${esc(w.title)}</div></div>
+    </article>`;
+}
+
+function refreshWebCard(id) {
+  const w = browse.byId.get(id);
+  const slot = document.querySelector(`.card--web[data-web-id="${id}"] .webcard__state`);
+  if (w && slot) slot.innerHTML = webStateHtml(w);
+}
+
+function appendWebCards(list) {
+  const grid = $('#web-grid');
+  grid.insertAdjacentHTML('beforeend', list.map(webCardHtml).join(''));
+  for (const card of [...grid.children].slice(-list.length)) {
+    cardObserver.observe(card);
+    card.addEventListener('mouseenter', () => hoverWebCard(card, true));
+    card.addEventListener('mouseleave', () => hoverWebCard(card, false));
+    card.addEventListener('focusin', () => hoverWebCard(card, true));
+    card.addEventListener('focusout', (e) => { if (!card.contains(e.relatedTarget)) hoverWebCard(card, false); });
+  }
+}
+
+// Thumbnails load a little ahead of scrolling.
+const cardObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    cardObserver.unobserve(e.target);
+    loadWebThumb(e.target);
+  }
+}, { root: $('#view-browse'), rootMargin: '600px 0px' });
+
+// Big cards get the sharper 960-wide image; the rest the 546-wide one.
+function webThumbSize() {
+  const cardPx = ($('#web-grid').clientWidth / browseCols) * devicePixelRatio;
+  return cardPx > 560 ? '960x540' : '546x308';
+}
+
+async function loadWebThumb(card) {
+  const w = browse.byId.get(card.dataset.webId);
+  const size = webThumbSize();
+  const current = card.querySelector('.webcard__thumb');
+  if (!w || current?.dataset.size === size || current?.dataset.size === '960x540') return; // never trade down
+  const url = await webMedia(`/i/c/${size}/media/${w.thumbFile}`).catch(() => null);
+  if (!url || !card.isConnected) return;
+  const img = new Image();
+  img.alt = '';
+  img.className = 'webcard__thumb';
+  img.dataset.size = size;
+  img.onload = () => {
+    img.classList.add('is-on');
+    if (old) setTimeout(() => old.remove(), 360); // the sharper copy fades in over the old one
+  };
+  img.src = url;
+  const old = card.querySelector('.webcard__thumb');
+  const placeholder = card.querySelector('.card__placeholder');
+  if (placeholder) placeholder.replaceWith(img);
+  else (old || card.querySelector('.webcard__tag')).after(img);
+}
+
+// A card's preview plays only while the pointer rests on it (or it has keyboard focus). The short
+// delay keeps a pointer that's just passing over from fetching anything.
+function hoverWebCard(card, on) {
+  clearTimeout(card.hoverTimer);
+  card.toggleAttribute('data-hover', on);
+  if (on) card.hoverTimer = setTimeout(() => startWebPreview(card), 120);
+  else stopWebPreview(card);
+}
+
+async function startWebPreview(card) {
+  const w = browse.byId.get(card.dataset.webId);
+  if (!w || card.querySelector('video')) return;
+  card.classList.add('is-fetching');
+  const url = await webMedia(w.preview, `b${browse.gen}:${w.id}`, true).catch(() => null);
+  card.classList.remove('is-fetching');
+  // The pointer may have moved on while the clip downloaded.
+  if (!url || !card.isConnected || !card.hasAttribute('data-hover') || document.hidden || card.querySelector('video')) return;
+  const video = document.createElement('video');
+  video.muted = true; video.loop = true; video.playsInline = true;
+  video.className = 'webcard__video';
+  video.addEventListener('playing', () => video.classList.add('is-on'), { once: true });
+  video.src = url;
+  card.querySelector('.card__media').insertBefore(video, card.querySelector('.webcard__tag'));
+  video.play().catch(() => {});
+}
+function stopWebPreview(card) {
+  card.classList.remove('is-fetching');
+  const video = card.querySelector('video');
+  if (video) stopVideo(video);
+  else rpc('web.cancel', { group: `b${browse.gen}:${card.dataset.webId}` }).catch(() => {}); // still queued? drop it
+}
+// Detached videos keep decoding unless their source is dropped.
+function stopVideo(video) {
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  video.remove();
+}
+
+function runWebSearch(text) {
+  clearTimeout(webSearchTimer);
+  const q = text.trim();
+  if (q === browse.query) return;
+  browse.query = q;
+  browseReset();
+}
+
+async function webDownload(w, quality = bestQuality(w)) {
+  if (browse.downloads.has(w.id)) return;
+  browse.downloads.set(w.id, { quality, received: 0, total: 0 });
+  refreshWebCard(w.id);
+  try {
+    const { path } = await rpc('web.download', { id: w.id, quality });
+    addPaths([path]);
+    const item = itemByPath(path);
+    item.name = w.title;
+    item.source = { site: 'motionbgs', id: w.id, quality, page: w.page };
+    saveLibrary();
+    toast(`“${w.title}” is in your library`, { action: `Set on monitor ${state.selected}`, onAction: () => applyFromLibrary(item, state.selected) });
+  } catch (e) {
+    if (e.message !== 'cancelled') toast(`Couldn't download “${w.title}”: ${e.message}`);
+  } finally {
+    browse.downloads.delete(w.id);
+    refreshWebCard(w.id);
+  }
+}
+
+onHost('download', (d) => {
+  const dl = browse.downloads.get(d.id);
+  if (!dl) return;
+  dl.received = d.received;
+  dl.total = d.total;
+  const bar = document.querySelector(`.card--web[data-web-id="${d.id}"] .webcard__progress`);
+  if (!bar) return;
+  bar.style.setProperty('--p', `${dl.total ? (dl.received / dl.total) * 100 : 0}%`);
+  bar.querySelector('span').textContent = webProgressText(dl);
+});
+
+function webCardClick(card) {
+  const w = browse.byId.get(card.dataset.webId);
+  if (!w || browse.downloads.has(w.id)) return;
+  const owned = ownedWeb(w.id);
+  if (owned) applyFromLibrary(owned, state.selected);
+  else webDownload(w);
+}
+
+function webMenu(w, x, y) {
+  const entries = [];
+  const owned = ownedWeb(w.id);
+  if (owned) {
+    for (const m of state.monitors) entries.push({ label: `Show on monitor ${m.number}`, run: () => applyFromLibrary(owned, m.number) });
+    entries.push('-');
+  }
+  if (browse.downloads.has(w.id)) {
+    entries.push({ label: 'Cancel download', run: () => rpc('web.cancelDownload', { id: w.id }) });
+  } else {
+    if (w.has4k) entries.push({ label: owned ? 'Download 4K again' : 'Download 4K', run: () => webDownload(w, '4k') });
+    entries.push({ label: owned ? 'Download HD again' : 'Download HD', run: () => webDownload(w, 'hd') });
+  }
+  entries.push('-');
+  entries.push({ label: 'Open in browser', run: () => rpc('openExternal', { url: SITE + w.page }) });
+  openMenu(x, y, entries);
+}
+
+// The slider sets how many cards share a row; fewer means bigger cards. The card at the top of
+// the screen stays put while the grid reflows, so dragging doesn't lose your place.
+function setBrowseCols(n, { save = true } = {}) {
+  const view = $('#view-browse'), grid = $('#web-grid');
+  const top = view.getBoundingClientRect().top;
+  const anchor = [...grid.children].find((c) => c.getBoundingClientRect().bottom > top);
+  const offset = anchor ? anchor.getBoundingClientRect().top - top : 0;
+  browseCols = n;
+  grid.style.setProperty('--cols', n);
+  const input = $('#web-cols');
+  input.value = n;
+  input.style.setProperty('--fill', `${((n - 2) / 6) * 100}%`);
+  $('#web-cols-value').textContent = n;
+  if (anchor) view.scrollTop += anchor.getBoundingClientRect().top - top - offset;
+  if (save) localStorage.setItem('browseColumns', n);
+  // Re-check which thumbnails are near the screen: bigger cards may want sharper images.
+  for (const card of grid.children) cardObserver.observe(card);
+  maybeMoreWeb();
+}
+setBrowseCols(browseCols, { save: false });
+
+$('#view-browse').addEventListener('scroll', maybeMoreWeb, { passive: true });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return;
+  for (const card of document.querySelectorAll('.card--web[data-hover]')) hoverWebCard(card, false);
+});
+
 // ---------- rendering: settings ----------
 
 function renderSettings() {
@@ -714,7 +1091,7 @@ async function addFolderDialog() {
   const res = await rpc('pickFolder');
   if (!res) return;
   if (!state.library.folders.some((f) => keyOf(f) === keyOf(res.folder))) state.library.folders.push(res.folder);
-  const n = addPaths(res.videos);
+  const n = addPaths(res.videos, { fromFolderScan: true });
   saveLibrary();
   toast(res.videos.length ? `Added ${n} video${n === 1 ? '' : 's'} from the folder` : 'No videos in that folder yet. New ones are added when you open Wallpaper Plus.');
   render();
@@ -725,6 +1102,8 @@ function removeItem(item) {
   for (const m of users) settingFor(m.number).videos = settingFor(m.number).videos.filter((p) => keyOf(p) !== keyOf(item.path));
   if (users.length) saveConfig();
   state.library.items = state.library.items.filter((i) => i !== item);
+  // Remember the removal, or the next scan of its folder would add it straight back.
+  if (state.library.folders.some((f) => isInside(item.path, f)) && !isExcluded(item.path)) state.library.excluded.push(keyOf(item.path));
   rpc('deleteThumb', { id: item.id }).catch(() => {});
   saveLibrary();
   render();
@@ -780,6 +1159,7 @@ document.addEventListener('click', async (e) => {
 
   const el = e.target.closest('[data-action]');
   const card = e.target.closest('.card');
+  if (!el && card?.dataset.webId) return webCardClick(card);
   if (!el && card) { // plain click on a library card
     const item = state.library.items.find((i) => i.id === card.dataset.id);
     if (!item) return;
@@ -866,6 +1246,7 @@ document.addEventListener('click', async (e) => {
       case 'add-folder': await addFolderDialog(); break;
       case 'remove-folder':
         state.library.folders = state.library.folders.filter((f) => f !== el.dataset.folder);
+        state.library.excluded = state.library.excluded.filter((k) => state.library.folders.some((f) => isInside(k, f)));
         saveLibrary(); renderSettings();
         toast('Folder removed. Videos already in your library stay.');
         break;
@@ -899,6 +1280,22 @@ document.addEventListener('click', async (e) => {
       case 'win':
         await rpc('window', { action: el.dataset.win });
         break;
+      case 'web-topic':
+        browse.topic = el.dataset.path;
+        browse.query = '';
+        $('#web-search').value = '';
+        clearTimeout(webSearchTimer);
+        browseReset();
+        break;
+      case 'web-get': webDownload(browse.byId.get(el.dataset.webId), el.dataset.quality); break;
+      case 'web-cancel': await rpc('web.cancelDownload', { id: el.dataset.webId }); break;
+      case 'web-apply': applyFromLibrary(ownedWeb(el.dataset.webId), state.selected); break;
+      case 'web-retry': browseMore(); break;
+      case 'web-menu': {
+        const r = el.getBoundingClientRect();
+        webMenu(browse.byId.get(el.dataset.webId), r.right - 220, r.bottom + 6);
+        break;
+      }
     }
   } catch (err) {
     toast(err.message);
@@ -923,6 +1320,11 @@ document.addEventListener('input', (e) => {
   } else if (el.id === 'search') {
     state.search = el.value;
     renderLibrary();
+  } else if (el.id === 'web-cols') {
+    setBrowseCols(Number(el.value));
+  } else if (el.id === 'web-search') {
+    clearTimeout(webSearchTimer);
+    webSearchTimer = setTimeout(() => runWebSearch(el.value), 450);
   }
 });
 
@@ -942,6 +1344,7 @@ document.addEventListener('keydown', (e) => {
     if (!$('#menu').hidden) return closeMenu();
     if (state.pick) return setView('monitors');
   }
+  if (e.key === 'Enter' && e.target.id === 'web-search') return runWebSearch(e.target.value);
   const card = e.target.closest?.('.card');
   if (card && (e.key === 'Enter' || e.key === ' ') && e.target === card) { e.preventDefault(); card.click(); }
 });
@@ -950,6 +1353,7 @@ document.addEventListener('contextmenu', (e) => {
   const card = e.target.closest('.card');
   e.preventDefault();
   if (!card) return;
+  if (card.dataset.webId) return webMenu(browse.byId.get(card.dataset.webId), e.clientX, e.clientY);
   const item = state.library.items.find((i) => i.id === card.dataset.id);
   if (item) cardMenu(item, e.clientX, e.clientY);
 });
@@ -991,7 +1395,7 @@ async function init() {
   state.config = s.config;
   state.playerRunning = s.playerRunning;
   const lib = s.library || {};
-  state.library = { version: 1, folders: lib.folders || [], items: Array.isArray(lib.items) ? lib.items : [] };
+  state.library = { version: 1, folders: lib.folders || [], items: Array.isArray(lib.items) ? lib.items : [], excluded: Array.isArray(lib.excluded) ? lib.excluded : [] };
   state.selected = (s.monitors.find((m) => m.primary) || s.monitors[0] || { number: 1 }).number;
   for (const m of state.monitors) settingFor(m.number);
 

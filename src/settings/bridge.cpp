@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <stdexcept>
 #include <vector>
 
@@ -72,6 +73,57 @@ static std::vector<std::wstring> ScanFolder(const std::wstring& folder) {
     }
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// ---------- browse cache ----------
+
+// Cache files are named by a hash of the site path, keeping the extension so the page's video
+// and image elements recognise them.
+static std::wstring CacheName(const std::string& path) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : path) h = (h ^ c) * 1099511628211ull;
+    wchar_t name[32];
+    swprintf_s(name, L"%016llx", (unsigned long long)h);
+    return name + Wide(path.substr(path.find_last_of('.')));
+}
+
+// Keeps the cache from growing forever: past 400 MB, the oldest files go until it's under 300 MB.
+// Leftover partial files from an interrupted run are removed too.
+static void PruneCache(const std::wstring& dir) {
+    struct Entry { fs::file_time_type time; uintmax_t size; fs::path path; };
+    std::vector<Entry> files;
+    uintmax_t total = 0;
+    std::error_code ec;
+    for (auto& e : fs::directory_iterator(dir, ec)) {
+        if (!e.is_regular_file(ec)) continue;
+        if (e.path().extension() == L".part") { fs::remove(e.path(), ec); continue; }
+        uintmax_t size = e.file_size(ec);
+        files.push_back({e.last_write_time(ec), size, e.path()});
+        total += size;
+    }
+    if (total <= (400ull << 20)) return;
+    std::sort(files.begin(), files.end(), [](const Entry& a, const Entry& b) { return a.time < b.time; });
+    for (auto& f : files) {
+        if (total <= (300ull << 20)) break;
+        if (fs::remove(f.path, ec)) total -= f.size;
+    }
+}
+
+static std::wstring VideosFolder() {
+    PWSTR videos = nullptr;
+    std::wstring out;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Videos, KF_FLAG_CREATE, nullptr, &videos))) out = videos;
+    CoTaskMemFree(videos);
+    return out;
+}
+
+// Only characters that are safe in a Windows file name; the server's name is a suggestion.
+static std::wstring SafeFileName(const std::wstring& name) {
+    std::wstring out;
+    for (wchar_t c : name)
+        if (iswalnum(c) || c == L'.' || c == L'-' || c == L'_') out += c;
+    while (!out.empty() && out[0] == L'.') out.erase(0, 1);
+    return out.size() > 150 ? out.substr(out.size() - 150) : out;
 }
 
 // ---------- config <-> json ----------
@@ -209,10 +261,23 @@ void Bridge::Attach(HWND hwnd, ICoreWebView2* webview, const std::wstring& exeDi
     configPath_ = exeDir + L"\\wallpaper.ini";
     libraryPath_ = exeDir + L"\\library.json";
     thumbsDir_ = exeDir + L"\\thumbs";
+    webCacheDir_ = exeDir + L"\\webcache";
     CreateDirectoryW(thumbsDir_.c_str(), nullptr);
-    if (webview3_)
+    CreateDirectoryW(webCacheDir_.c_str(), nullptr);
+    if (webview3_) {
         webview3_->SetVirtualHostNameToFolderMapping(L"thumbs.wallpaperplus", thumbsDir_.c_str(),
                                                     COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+        webview3_->SetVirtualHostNameToFolderMapping(L"webcache.wallpaperplus", webCacheDir_.c_str(),
+                                                    COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_ALLOW);
+    }
+    fetches_.Push(9, "prune", [dir = webCacheDir_](bool cancelled) {
+        if (cancelled) return;
+        PruneCache(dir);
+        // Downloads cut off by closing the window leave a partial file behind.
+        std::error_code ec;
+        for (auto& e : fs::directory_iterator(VideosFolder() + L"\\Wallpaper Plus", ec))
+            if (e.path().extension() == L".part") fs::remove(e.path(), ec);
+    });
     DWORD drives = GetLogicalDrives();
     for (int i = 0; i < 26 && webview3_; ++i) {
         if (!(drives & (1u << i))) continue;
@@ -274,7 +339,13 @@ void Bridge::Attach(HWND hwnd, ICoreWebView2* webview, const std::wstring& exeDi
 
 void Bridge::Send(const json& message) {
     if (!webview_) return;
-    webview_->PostWebMessageAsJson(Wide(message.dump()).c_str());
+    // Text from the site isn't guaranteed to be valid UTF-8; bad bytes become U+FFFD.
+    webview_->PostWebMessageAsJson(Wide(message.dump(-1, ' ', false, json::error_handler_t::replace)).c_str());
+}
+
+void Bridge::Deliver(LPARAM message) {
+    std::unique_ptr<std::string> text(reinterpret_cast<std::string*>(message));
+    if (webview_) webview_->PostWebMessageAsJson(Wide(*text).c_str());
 }
 
 static json WindowState(HWND hwnd) {
@@ -337,6 +408,15 @@ HRESULT Bridge::OnMessage(ICoreWebView2WebMessageReceivedEventArgs* args) {
             }
         }
         Send({{"event", "dropped"}, {"data", paths}});
+        return S_OK;
+    }
+
+    if (cmd.rfind("web.", 0) == 0) {
+        try {
+            HandleWeb(msg.value("id", json()), cmd, msg.value("args", json::object()));
+        } catch (const std::exception& e) {
+            Send({{"id", msg.value("id", json())}, {"error", e.what()}});
+        }
         return S_OK;
     }
 
@@ -471,6 +551,12 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
         }
         return nullptr;
     }
+    if (cmd == "openExternal") {  // "Open in browser" in the Browse tab's menu
+        std::string url = args.at("url");
+        if (url.rfind("https://motionbgs.com/", 0) != 0) throw std::runtime_error("That link can't be opened");
+        ShellExecuteW(nullptr, L"open", Wide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return true;
+    }
     if (cmd == "playerRunning") return FindWindowW(kControllerClass, nullptr) != nullptr;
     if (cmd == "startPlayer") {
         std::wstring exe = exeDir_ + L"\\WallpaperPlus.exe";
@@ -480,5 +566,147 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
         if (HWND player = FindWindowW(kControllerClass, nullptr)) PostMessageW(player, WM_CLOSE, 0, 0);
         return true;
     }
+    throw std::runtime_error("unknown command: " + cmd);
+}
+
+// ---------- browse (motionbgs.com) ----------
+//
+// web.page     {path}          -> {status, url, html}   a listing or search page, as text
+// web.media    {path, group, urgent} -> "https://webcache.wallpaperplus/<file>"  thumbnail or preview clip
+// web.cancel   {group}         answers "cancelled" to that group's media requests not yet started
+// web.download {id, quality}   -> {path}  the full wallpaper, saved into Videos\Wallpaper Plus; progress
+//                              arrives meanwhile as {event: "download", data: {id, received, total}}
+// web.cancelDownload {id}
+void Bridge::HandleWeb(const json& id, const std::string& cmd, const json& args) {
+    // Replies from worker threads travel through the window's message queue (see Deliver).
+    auto post = [hwnd = hwnd_](const json& message) {
+        auto* text = new std::string(message.dump(-1, ' ', false, json::error_handler_t::replace));
+        if (!PostMessageW(hwnd, WM_APP_BRIDGE, 0, reinterpret_cast<LPARAM>(text))) delete text;
+    };
+    auto fail = [post, id](const std::string& error) { post({{"id", id}, {"error", error}}); };
+
+    if (cmd == "web.page") {
+        std::string path = args.at("path");
+        static const std::regex kPage(R"(^/[A-Za-z0-9/:._%?=&+!'()*~-]{0,300}$)");
+        if (!std::regex_match(path, kPage)) throw std::runtime_error("bad page path");
+        fetches_.Push(0, "page", [path, post, fail, id](bool cancelled) {
+            if (cancelled) return fail("cancelled");
+            try {
+                std::string html;
+                auto res = web::Get(Wide(path), [&](const char* data, size_t n) {
+                    html.append(data, n);
+                    return html.size() < (8u << 20);
+                });
+                std::string url = Utf8(res.finalUrl);
+                const std::string site = "https://motionbgs.com";
+                if (url.rfind(site, 0) == 0) url = url.substr(site.size());
+                post({{"id", id}, {"result", {{"status", res.status}, {"url", url}, {"html", html}}}});
+            } catch (const std::exception& e) {
+                fail(e.what());
+            }
+        });
+        return;
+    }
+
+    if (cmd == "web.media") {
+        std::string path = args.at("path"), group = args.value("group", "");
+        static const std::regex kMedia(R"(^/(i/c/\d+x\d+/)?media/\d+/[A-Za-z0-9._-]+\.(jpg|mp4)$)");
+        if (!std::regex_match(path, kMedia)) throw std::runtime_error("bad media path");
+        std::wstring name = CacheName(path), file = webCacheDir_ + L"\\" + name;
+        std::string url = "https://webcache.wallpaperplus/" + Utf8(name);
+        std::error_code ec;
+        if (fs::file_size(file, ec) > 0 && !ec) return Send({{"id", id}, {"result", url}});
+        const bool clip = path.size() > 4 && path.compare(path.size() - 4, 4, ".mp4") == 0;
+        const int priority = args.value("urgent", false) ? 0 : clip ? 2 : 1;  // urgent: the clip being hovered
+        fetches_.Push(priority, group, [path, file, url, post, fail, id](bool cancelled) {
+            if (cancelled) return fail("cancelled");
+            std::wstring part = file + L"." + std::to_wstring(GetCurrentThreadId()) + L".part";
+            try {
+                web::Response res;
+                {
+                    std::ofstream out(part, std::ios::binary | std::ios::trunc);
+                    res = web::Get(Wide(path), [&](const char* data, size_t n) {
+                        out.write(data, (std::streamsize)n);
+                        return (bool)out;
+                    });
+                    if (!out) throw std::runtime_error("cache write failed");
+                }
+                if (res.status != 200) throw std::runtime_error("not available");
+                if (!MoveFileExW(part.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) throw std::runtime_error("cache write failed");
+                post({{"id", id}, {"result", url}});
+            } catch (const std::exception& e) {
+                DeleteFileW(part.c_str());
+                fail(e.what());
+            }
+        });
+        return;
+    }
+
+    if (cmd == "web.cancel") {
+        fetches_.CancelGroup(args.value("group", ""));
+        return Send({{"id", id}, {"result", true}});
+    }
+
+    if (cmd == "web.download") {
+        std::string wallpaper = args.at("id"), quality = args.value("quality", "hd");
+        if (wallpaper.empty() || wallpaper.size() > 12 ||
+            !std::all_of(wallpaper.begin(), wallpaper.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            throw std::runtime_error("bad wallpaper id");
+        if (quality != "hd" && quality != "4k") throw std::runtime_error("bad quality");
+        std::wstring folder = VideosFolder();
+        if (folder.empty()) throw std::runtime_error("Couldn't find your Videos folder");
+        folder += L"\\Wallpaper Plus";
+        auto cancel = std::make_shared<std::atomic<bool>>(false);
+        downloadCancel_[wallpaper] = cancel;
+        downloads_.Push(0, "dl:" + wallpaper, [=](bool cancelled) {
+            if (cancelled || *cancel) return fail("cancelled");
+            CreateDirectoryW(folder.c_str(), nullptr);
+            std::wstring part = folder + L"\\" + Wide(wallpaper) + L"-" + Wide(quality) + L".part";
+            try {
+                uint64_t received = 0, total = 0;
+                ULONGLONG lastReport = 0;
+                web::Response res;
+                {
+                    std::ofstream out(part, std::ios::binary | std::ios::trunc);
+                    res = web::Get(
+                        Wide("/dl/" + quality + "/" + wallpaper + "/"),
+                        [&](const char* data, size_t n) {
+                            out.write(data, (std::streamsize)n);
+                            received += n;
+                            ULONGLONG now = GetTickCount64();
+                            if (now - lastReport >= 200) {  // a few updates a second is plenty for a bar
+                                lastReport = now;
+                                post({{"event", "download"},
+                                      {"data", {{"id", wallpaper}, {"received", received}, {"total", total}}}});
+                            }
+                            return (bool)out && !*cancel;
+                        },
+                        [&](const web::Response& head) { total = head.length; });
+                    if (!out) throw std::runtime_error("Couldn't write the file");
+                }
+                if (*cancel) throw std::runtime_error("cancelled");
+                if (res.status != 200) throw std::runtime_error("The server didn't send the file (error " + std::to_string(res.status) + ")");
+                if (res.length && received != res.length) throw std::runtime_error("The download was cut short");
+                std::wstring name = SafeFileName(res.filename);
+                if (name.size() < 5 || !IsVideo(name)) name = L"wallpaper-" + Wide(wallpaper) + L"-" + Wide(quality) + L".mp4";
+                std::wstring target = folder + L"\\" + name;
+                if (!MoveFileExW(part.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING))
+                    throw std::runtime_error("Couldn't save the file");
+                post({{"id", id}, {"result", {{"path", Utf8(target)}}}});
+            } catch (const std::exception& e) {
+                DeleteFileW(part.c_str());
+                fail(e.what());
+            }
+        });
+        return;
+    }
+
+    if (cmd == "web.cancelDownload") {
+        std::string wallpaper = args.at("id");
+        if (auto it = downloadCancel_.find(wallpaper); it != downloadCancel_.end()) *it->second = true;
+        downloads_.CancelGroup("dl:" + wallpaper);
+        return Send({{"id", id}, {"result", true}});
+    }
+
     throw std::runtime_error("unknown command: " + cmd);
 }
