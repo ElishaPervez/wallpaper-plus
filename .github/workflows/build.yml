@@ -1,0 +1,85 @@
+# Builds both programs and the installer on every push to main and every pull request, and keeps
+# the installer as a downloadable artifact of the run. Pushing a tag like v1.2.3 also publishes a
+# GitHub Release "Wallpaper Plus 1.2.3" with WallpaperPlus-Setup-1.2.3.exe attached.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Puts cl, rc, fxc and link on PATH and sets VSCMD_VER, so build.bat skips its own
+      # Build Tools path.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build
+        shell: cmd
+        run: call build.bat
+
+      - name: Pick version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DAppVersion=${{ steps.version.outputs.version }}" installer\WallpaperPlus.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WallpaperPlus-Setup-${{ steps.version.outputs.version }}
+          path: release/WallpaperPlus-Setup-${{ steps.version.outputs.version }}.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: WallpaperPlus-Setup-${{ needs.build.outputs.version }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Wallpaper Plus ${{ needs.build.outputs.version }}
+          files: WallpaperPlus-Setup-${{ needs.build.outputs.version }}.exe
+          body: |
+            Download **WallpaperPlus-Setup-${{ needs.build.outputs.version }}.exe** below and run it.
+
+            - Windows asks for admin permission, because Wallpaper Plus installs into Program Files.
+            - The installer isn't code-signed, so Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
+            - Installing over an older version keeps your settings and library.
+
+            Needs 64-bit Windows 11.

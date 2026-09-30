@@ -1,0 +1,3 @@
+# cmd can misread labels in batch files with Unix line endings; bash chokes on Windows ones.
+*.bat text eol=crlf
+*.sh text eol=lf
