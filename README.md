@@ -6,6 +6,12 @@ Video wallpapers for Windows 11. Pick a video, or a playlist of them, for each m
 behind your desktop icons. The player is small and stays out of the way: videos are decoded and
 drawn by the graphics card, and playback stops while you can't see it.
 
+<p align="center">
+  <a href="https://github.com/ElishaPervez/wallpaper-plus/releases/download/v0.1.0/WallpaperPlus-promo.mp4"><img src="media/readme-preview.gif" width="900" alt="Wallpaper Plus in action"></a>
+  <br>
+  <a href="https://github.com/ElishaPervez/wallpaper-plus/releases/download/v0.1.0/WallpaperPlus-promo.mp4">▶ Watch with sound</a> (26 seconds)
+</p>
+
 ## Features
 
 - **A wallpaper per monitor.** The Monitors tab shows your screens as they're laid out on your
@@ -40,6 +46,27 @@ once closed. When the player quits, your normal Windows wallpaper comes back.
 
 **Video formats.** H.264 always plays. HEVC and AV1 videos need Microsoft's free "HEVC Video
 Extensions" and "AV1 Video Extension" from the Microsoft Store. Wallpapers play without sound.
+
+## Screenshots
+
+**Monitors:** your screens as they sit on your desk, with the selected monitor's wallpaper, fit,
+brightness and speed.
+
+![Monitors tab](media/monitors.png)
+
+**Library:** your videos. Hover a card and its preview plays, with buttons to put it on monitor 1
+or 2.
+
+![Library tab](media/library-hover.png)
+
+**Browse:** wallpapers from motionbgs.com by topic. Hover one to preview it and download it in HD
+or 4K.
+
+![Browse tab](media/browse-hover.png)
+
+**Settings:** frame rate cap, which decoder each monitor is using right now, and when to pause.
+
+![Settings tab](media/settings.png)
 
 ## Requirements
 
