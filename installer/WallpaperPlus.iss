@@ -45,8 +45,6 @@ WizardStyle=modern
 ; The running copies are closed in [Code]; this only mops up if that didn't work. The player is
 ; started again by [Run], not by Windows' Restart Manager.
 RestartApplications=no
-; {userappdata} / {localappdata} in [Code] are deliberate; see CurUninstallStepChanged.
-UsedUserAreasWarning=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -128,19 +126,32 @@ end;
 
 // The uninstaller runs elevated. With a standard account that elevated with another (admin)
 // account's password, HKCU and {userappdata} / {localappdata} here are that admin account's, not
-// the user's who ran Wallpaper Plus; their sign-in entry and settings then stay behind.
+// the user's who ran Wallpaper Plus, and Inno Setup can't run anything as the original user while
+// uninstalling (ExecAsOriginalUser and runasoriginaluser are install-only). So the per-user
+// cleanup is done by WallpaperPlus.exe --uninstall-cleanup (src\player\uninstall.h), which works
+// out who is signed in to this session and cleans up theirs. It needs the exe, so it runs before
+// the files are removed, and the question comes first.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  DeleteData: Boolean;
+  Params: String;
+  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then begin
     CloseRunningCopies();
+    DeleteData := SuppressibleMsgBox('Also delete your settings and library?' + #13#10 + #13#10 +
+                                     'Your video files are not deleted either way.',
+                                     mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES;
+    Params := '--uninstall-cleanup';
+    if DeleteData then Params := Params + ' --delete-data';
+    if not Exec(ExpandConstant('{app}\WallpaperPlus.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+      ResultCode := 2;
+    // The approving account's own entry, even if the exe couldn't run. Removing it is always right:
+    // it would point at a program that's about to be gone.
     RegDeleteValue(HKEY_CURRENT_USER, RunKey, RunValue);
-  end;
-  if CurUninstallStep = usPostUninstall then begin
-    if SuppressibleMsgBox('Also delete your settings and library?' + #13#10 + #13#10 +
-                          'Your video files are not deleted either way.',
-                          mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then begin
-      DelTree(ExpandConstant('{userappdata}\WallpaperPlus'), True, True, True);
-      DelTree(ExpandConstant('{localappdata}\WallpaperPlus'), True, True, True);
-    end;
+    if DeleteData and (ResultCode <> 0) then
+      SuppressibleMsgBox('Some of your Wallpaper Plus settings couldn''t be deleted.' + #13#10 + #13#10 +
+                         'You can delete them yourself: the WallpaperPlus folders in %APPDATA% and %LOCALAPPDATA%.',
+                         mbInformation, MB_OK, IDOK);
   end;
 end;

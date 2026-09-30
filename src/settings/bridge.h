@@ -27,7 +27,8 @@ constexpr UINT WM_APP_BRIDGE = WM_APP + 2;
 // webcache\ (thumbnails and preview clips from motionbgs.com). Downloaded wallpapers go to
 // Videos\Wallpaper Plus.
 //
-// Commands starting with "web." answer later, from background threads (see HandleWeb).
+// Commands starting with "web." answer later, from background threads (see HandleWeb), and so do
+// the ones that look at the library's files (see HandleFiles).
 class Bridge {
 public:
     void Attach(HWND hwnd, ICoreWebView2* webview, const std::wstring& exeDir);
@@ -41,6 +42,7 @@ private:
     HRESULT OnMessage(ICoreWebView2WebMessageReceivedEventArgs* args);
     nlohmann::json Handle(const std::string& cmd, const nlohmann::json& args);
     void HandleWeb(const nlohmann::json& id, const std::string& cmd, const nlohmann::json& args);
+    void HandleFiles(const nlohmann::json& id, const std::string& cmd, const nlohmann::json& args);
     void Send(const nlohmann::json& message);
     std::string MediaUrl(const std::wstring& path);
 
@@ -50,5 +52,6 @@ private:
     std::wstring exeDir_, dataDir_, configPath_, libraryPath_, thumbsDir_, webCacheDir_;
     web::WorkQueue fetches_{6};    // pages, thumbnails, preview clips
     web::WorkQueue downloads_{1};  // full wallpapers, one at a time
+    web::WorkQueue files_{2};      // library file checks and folder scans (see HandleFiles)
     std::map<std::string, std::shared_ptr<std::atomic<bool>>> downloadCancel_;  // by wallpaper id
 };

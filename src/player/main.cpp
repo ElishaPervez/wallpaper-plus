@@ -16,6 +16,7 @@
 #include "paths.h"
 #include "player.h"
 #include "tray.h"
+#include "uninstall.h"
 
 #include <windows.h>
 #include <mfapi.h>
@@ -23,6 +24,7 @@
 #include <wtsapi32.h>
 #include <algorithm>
 #include <memory>
+#include <thread>
 #include <vector>
 
 static const wchar_t kControllerClass[] = L"WallpaperPlus.Controller";
@@ -35,6 +37,12 @@ static const wchar_t kRunValue[] = L"WallpaperPlus";
 static constexpr UINT WM_APP_OPEN_SETTINGS = WM_APP + 40;
 
 enum TimerId : UINT_PTR { kTimerCover = 1, kTimerConfig, kTimerRebuild, kTimerHealth };
+
+// How long quitting or a rebuild waits for the monitors' players to stop, all together.
+static constexpr DWORD kStopWaitMs = 3000;
+// Quitting ends the process after this long whatever is still running, well inside the 10 s the
+// installer waits for it to go.
+static constexpr DWORD kExitDeadlineMs = 8000;
 
 static void ApplyAutostart(bool enable) {
     HKEY key;
@@ -127,7 +135,7 @@ private:
     void Build();
     void Teardown();
     void StartMonitor(size_t i);
-    void StopMonitor(size_t i);
+    bool AnyPlayerStuck();
     PlaybackSettings SettingsFor(size_t i) const { return {config_.ForMonitor((int)i + 1), config_.fpsCap}; }
     void ReloadConfig(bool force);
     void RecomputeCover();
@@ -143,11 +151,12 @@ private:
     FILETIME configStamp_{};
     Config config_;
 
-    GpuSet gpus_;
+    std::unique_ptr<GpuSet> gpus_ = std::make_unique<GpuSet>();
     DesktopLayer layer_;
     std::vector<MonitorInfo> monitors_;
     std::vector<HWND> surfaces_;
     std::vector<std::unique_ptr<Player>> players_;
+    std::vector<Player*> abandoned_;  // stopped too slowly; never freed, see Teardown
     std::vector<bool> covered_;
 
     Tray tray_;
@@ -176,20 +185,14 @@ void App::StartMonitor(size_t i) {
     PlaceInLayer(s, layer_);
     surfaces_[i] = s;
     HMONITOR monitor = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
-    players_[i] = std::make_unique<Player>(gpus_, monitor, s, w, h, SettingsFor(i), controller_, (int)i + 1);
-}
-
-void App::StopMonitor(size_t i) {
-    players_[i].reset();  // joins the player thread, releasing its swap chain first
-    if (surfaces_[i]) DestroyWindow(surfaces_[i]);
-    surfaces_[i] = nullptr;
+    players_[i] = std::make_unique<Player>(*gpus_, monitor, s, w, h, SettingsFor(i), controller_, (int)i + 1);
 }
 
 void App::Build() {
     Teardown();
     KillTimer(controller_, kTimerRebuild);
 
-    if (!gpus_.Init(config_.decoder)) {
+    if (!gpus_->Init(config_.decoder)) {
         Log(L"No graphics device could be created; retrying");
         ScheduleRebuild(5000);
         return;
@@ -207,13 +210,46 @@ void App::Build() {
     RecomputeCover();
 }
 
+// All monitors are asked to stop first, then waited for together, so their wind-downs overlap.
+// Players release their swap chains on their own threads before their windows go.
+//
+// A player that doesn't finish in time is stuck in a call into Windows' media code that stop can't
+// cut short. It's left behind rather than waited for: the Player object and the GpuSet it draws
+// with are never freed, so whenever the call does return, the thread finds everything it uses
+// still there, sees the stop request and exits. Its window is destroyed now, which only makes its
+// last drawing calls fail. The rebuild carries on with fresh devices.
 void App::Teardown() {
-    for (size_t i = 0; i < players_.size(); ++i) StopMonitor(i);
+    for (auto& player : players_)
+        if (player) player->RequestStop();
+    const ULONGLONG deadline = GetTickCount64() + kStopWaitMs;
+    bool leftBehind = false;
+    for (size_t i = 0; i < players_.size(); ++i) {
+        if (players_[i]) {
+            const ULONGLONG now = GetTickCount64();
+            if (!players_[i]->WaitStopped(now < deadline ? (DWORD)(deadline - now) : 0)) {
+                Log(L"Monitor %zu: player didn't stop within %lu ms (a file on a drive that stopped responding?); "
+                    L"leaving it behind", i + 1, kStopWaitMs);
+                abandoned_.push_back(players_[i].release());
+                leftBehind = true;
+            }
+            players_[i].reset();
+        }
+        if (surfaces_[i]) DestroyWindow(surfaces_[i]);
+    }
     players_.clear();
     surfaces_.clear();
     covered_.clear();
-    gpus_.Reset();
+    if (leftBehind) {
+        (void)gpus_.release();  // the stuck player may still use these devices
+        gpus_ = std::make_unique<GpuSet>();
+    } else {
+        gpus_->Reset();
+    }
     WriteStatus();
+}
+
+bool App::AnyPlayerStuck() {
+    return std::any_of(abandoned_.begin(), abandoned_.end(), [](Player* p) { return !p->WaitStopped(0); });
 }
 
 // One line per playing monitor: number, then Player::Status() (device, hardware|processor, codec, size).
@@ -475,6 +511,13 @@ int App::Run(HINSTANCE inst) {
     }
 
     Log(L"Shutting down");
+    // Last resort, if something below hangs anyway: the tray icon is already gone at that point, so
+    // a process that never ends would be invisible, and would block installing an update.
+    std::thread([] {
+        Sleep(kExitDeadlineMs);
+        Log(L"Still shutting down after %lu ms; ending the process", kExitDeadlineMs);
+        TerminateProcess(GetCurrentProcess(), 0);
+    }).detach();
     if (watch != INVALID_HANDLE_VALUE) FindCloseChangeNotification(watch);
     tray_.Remove();
     cover_.Stop();
@@ -482,6 +525,12 @@ int App::Run(HINSTANCE inst) {
     Teardown();
     if (layer.parent && IsWindow(layer.parent)) RestoreStaticWallpaper(layer);
     if (power) UnregisterPowerSettingNotification(power);
+    if (AnyPlayerStuck()) {
+        // Its thread is still inside Media Foundation: shutting that down under it could crash it,
+        // and the normal exit would wait for it. The wallpaper is already back; just end.
+        Log(L"A player is still stuck; ending the process");
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
     MFShutdown();
     CoUninitialize();
     return 0;
@@ -493,6 +542,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
         if (HWND running = FindWindowW(kControllerClass, nullptr)) PostMessageW(running, WM_CLOSE, 0, 0);
         return 0;
     }
+    // Run by the uninstaller; see uninstall.h.
+    if (wcsstr(cmdLine, L"--uninstall-cleanup")) return UninstallCleanup(wcsstr(cmdLine, L"--delete-data") != nullptr);
 
     if (RefuseToRunFromArchive()) return 0;
 

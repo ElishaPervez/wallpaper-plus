@@ -4,8 +4,14 @@
 #include <codecapi.h>
 #include <mfidl.h>
 #include <propvarutil.h>
+#include <wrl/implements.h>
 #include <algorithm>
 #include <cstring>
+
+using Microsoft::WRL::ClassicCom;
+using Microsoft::WRL::Make;
+using Microsoft::WRL::RuntimeClass;
+using Microsoft::WRL::RuntimeClassFlags;
 
 // Monotonic clock in 100 ns units (Media Foundation's time unit).
 static LONGLONG Now100ns() {
@@ -24,17 +30,28 @@ Player::Player(GpuSet& gpus, HMONITOR monitor, HWND surface, int width, int heig
     : gpus_(gpus), monitor_(monitor), surface_(surface), width_(width), height_(height), controller_(controller), number_(number) {
     pending_ = std::move(settings);
     wake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!timer_) timer_ = CreateWaitableTimerW(nullptr, FALSE, nullptr);  // pre-1803 fallback
     thread_ = std::thread(&Player::Run, this);
 }
 
 Player::~Player() {
-    stop_ = true;
-    SetEvent(wake_);
+    RequestStop();
     if (thread_.joinable()) thread_.join();
     CloseHandle(wake_);
+    CloseHandle(stopEvent_);
     CloseHandle(timer_);
+}
+
+void Player::RequestStop() {
+    stop_ = true;
+    SetEvent(stopEvent_);
+    SetEvent(wake_);
+}
+
+bool Player::WaitStopped(DWORD ms) {
+    return !thread_.joinable() || WaitForSingleObject(thread_.native_handle(), ms) == WAIT_OBJECT_0;
 }
 
 void Player::Update(const PlaybackSettings& settings) {
@@ -132,10 +149,128 @@ bool Player::CreateSwapChain() {
     return true;
 }
 
+// Opening a file and reading a frame run on Media Foundation's own threads, with the player thread
+// waiting for the answer or for stop, whichever comes first. A file on a network drive that
+// stopped responding can take minutes to answer; stop doesn't have to wait for it.
+
+// Answer to BeginCreateObjectFromURL. A source that arrives after the player gave up is shut down.
+class OpenAnswer : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IMFAsyncCallback> {
+public:
+    explicit OpenAnswer(IMFSourceResolver* resolver) : resolver_(resolver) {}
+    ~OpenAnswer() { CloseHandle(done); }
+
+    STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
+    STDMETHODIMP Invoke(IMFAsyncResult* result) override {
+        MF_OBJECT_TYPE type = MF_OBJECT_INVALID;
+        ComPtr<IUnknown> object;
+        ComPtr<IMFMediaSource> source;
+        HRESULT hr = resolver_->EndCreateObjectFromURL(result, &type, &object);
+        if (SUCCEEDED(hr)) hr = object.As(&source);
+        std::lock_guard lock(mutex_);
+        if (abandoned_) {
+            if (source) source->Shutdown();
+        } else {
+            hr_ = hr;
+            source_ = source;
+        }
+        SetEvent(done);
+        return S_OK;
+    }
+    HRESULT Take(ComPtr<IMFMediaSource>& source) {
+        std::lock_guard lock(mutex_);
+        source = std::move(source_);
+        return hr_;
+    }
+    void Abandon() {
+        std::lock_guard lock(mutex_);
+        abandoned_ = true;
+        if (source_) source_->Shutdown();
+        source_.Reset();
+    }
+
+    const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+private:
+    ComPtr<IMFSourceResolver> resolver_;
+    std::mutex mutex_;
+    HRESULT hr_ = E_FAIL;
+    ComPtr<IMFMediaSource> source_;
+    bool abandoned_ = false;
+};
+
+// MFCreateSourceReaderFromURL that gives up with E_ABORT as soon as `stop` is set.
+static HRESULT CreateReader(const std::wstring& path, IMFAttributes* attrs, HANDLE stop, ComPtr<IMFSourceReader>& reader) {
+    ComPtr<IMFSourceResolver> resolver;
+    HRESULT hr = MFCreateSourceResolver(&resolver);
+    if (FAILED(hr)) return hr;
+    ComPtr<OpenAnswer> answer = Make<OpenAnswer>(resolver.Get());
+    if (!answer || !answer->done) return E_OUTOFMEMORY;
+    ComPtr<IUnknown> cancel;
+    hr = resolver->BeginCreateObjectFromURL(path.c_str(), MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ, nullptr,
+                                            &cancel, answer.Get(), nullptr);
+    if (FAILED(hr)) return hr;
+    HANDLE handles[] = {answer->done, stop};
+    if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0) {
+        answer->Abandon();
+        if (cancel) resolver->CancelObjectCreation(cancel.Get());
+        return E_ABORT;
+    }
+    ComPtr<IMFMediaSource> source;
+    if (FAILED(hr = answer->Take(source))) return hr;
+    hr = MFCreateSourceReaderFromMediaSource(source.Get(), attrs, &reader);  // the reader shuts it down when released
+    if (FAILED(hr)) source->Shutdown();
+    return hr;
+}
+
+// Answers of an asynchronous source reader's ReadSample, one at a time.
+class Player::Reads : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IMFSourceReaderCallback> {
+public:
+    ~Reads() { CloseHandle(done); }
+
+    STDMETHODIMP OnReadSample(HRESULT hr, DWORD, DWORD flags, LONGLONG ts, IMFSample* sample) override {
+        {
+            std::lock_guard lock(mutex_);
+            hr_ = hr;
+            flags_ = flags;
+            ts_ = ts;
+            sample_ = sample;
+        }
+        SetEvent(done);
+        return S_OK;
+    }
+    STDMETHODIMP OnFlush(DWORD) override { return S_OK; }
+    STDMETHODIMP OnEvent(DWORD, IMFMediaEvent*) override { return S_OK; }
+
+    HRESULT Take(DWORD& flags, LONGLONG& ts, ComPtr<IMFSample>& sample) {
+        std::lock_guard lock(mutex_);
+        flags = flags_;
+        ts = ts_;
+        sample = std::move(sample_);
+        return hr_;
+    }
+
+    const HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset: one per answer
+
+private:
+    std::mutex mutex_;
+    HRESULT hr_ = E_FAIL;
+    DWORD flags_ = 0;
+    LONGLONG ts_ = 0;
+    ComPtr<IMFSample> sample_;
+};
+
+HRESULT Player::ReadFrame(DWORD& flags, LONGLONG& ts, ComPtr<IMFSample>& sample) {
+    HRESULT hr = reader_->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, nullptr, nullptr, nullptr);
+    if (FAILED(hr)) return hr;
+    HANDLE handles[] = {reads_->done, stopEvent_};
+    if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0) return E_ABORT;
+    return reads_->Take(flags, ts, sample);
+}
+
 // Reads codec, size and bit depth from the file, to pick a decoder before creating one.
-static bool ProbeVideo(const std::wstring& path, VideoInfo& info, HRESULT& hr) {
+static bool ProbeVideo(const std::wstring& path, HANDLE stop, VideoInfo& info, HRESULT& hr) {
     ComPtr<IMFSourceReader> reader;
-    if (FAILED(hr = MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader))) return false;
+    if (FAILED(hr = CreateReader(path, nullptr, stop, reader))) return false;
     ComPtr<IMFMediaType> type;
     if (FAILED(hr = reader->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &type))) return false;
     info = {};
@@ -153,7 +288,8 @@ static bool ProbeVideo(const std::wstring& path, VideoInfo& info, HRESULT& hr) {
 bool Player::OpenVideo(const std::wstring& path) {
     reader_.Reset();
     HRESULT hr = S_OK;
-    if (!ProbeVideo(path, info_, hr)) {
+    if (!ProbeVideo(path, stopEvent_, info_, hr)) {
+        if (stop_) return false;
         Log(L"Monitor %d: can't open %s (0x%08X)", number_, path.c_str(), hr);
         return false;
     }
@@ -161,7 +297,7 @@ bool Player::OpenVideo(const std::wstring& path) {
     triedProcessor_ = false;
     retryHardware_ = false;
     if (OpenNextDecoder(path)) return true;
-    if (deviceLost_) return false;
+    if (deviceLost_ || stop_) return false;
     Log(L"Monitor %d: nothing on this PC can decode %s (%s). HEVC/AV1 need the Microsoft Store codec extensions.",
         number_, path.c_str(), CodecName(info_.codec));
     return false;
@@ -191,7 +327,7 @@ bool Player::OpenNextDecoder(const std::wstring& path, bool bestOnly) {
             return true;
         }
         reader_.Reset();
-        if (DeviceLost()) return false;
+        if (stop_ || DeviceLost()) return false;
         if (hardware) Log(L"Monitor %d: %s's decoder won't take this video; trying the next option", number_, gpu->name.c_str());
     }
 }
@@ -201,7 +337,7 @@ bool Player::DeviceLost(HRESULT hr) {
     if (!gpu_ || (hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET && !gpu_->Removed())) return false;
     Log(L"Monitor %d: GPU device lost (0x%08X)", number_, gpu_->device->GetDeviceRemovedReason());
     deviceLost_ = true;
-    PostMessageW(controller_, WM_APP_DEVICE_LOST, 0, 0);
+    if (!stop_) PostMessageW(controller_, WM_APP_DEVICE_LOST, 0, 0);  // stopping: the controller is done with us
     return true;
 }
 
@@ -234,8 +370,11 @@ bool Player::RetryHardware() {
 bool Player::OpenReader(const std::wstring& path, bool hardware) {
     reader_.Reset();
     hardware_ = hardware;
+    reads_ = Make<Reads>();
+    if (!reads_ || !reads_->done) return false;
     ComPtr<IMFAttributes> attrs;
-    MFCreateAttributes(&attrs, 3);
+    MFCreateAttributes(&attrs, 4);
+    attrs->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, reads_.Get());
     if (hardware) {
         attrs->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, gpu_->dxgiManager.Get());
         attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
@@ -245,8 +384,9 @@ bool Player::OpenReader(const std::wstring& path, bool hardware) {
         attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
     }
 
-    HRESULT hr = MFCreateSourceReaderFromURL(path.c_str(), attrs.Get(), &reader_);
+    HRESULT hr = CreateReader(path, attrs.Get(), stopEvent_, reader_);
     if (FAILED(hr)) {
+        if (stop_) return false;
         Log(L"Monitor %d: can't open %s (0x%08X)", number_, path.c_str(), hr);
         return false;
     }
@@ -716,6 +856,7 @@ bool Player::OpenCurrent() {
             return true;
         }
         if (deviceLost_) return false;  // not this video's fault: the rebuild starts over
+        if (stop_) return false;        // don't try the rest of the playlist on the way out
         index_ = (index_ + 1) % videos.size();  // skip unplayable entries
     }
     reader_.Reset();
@@ -809,7 +950,8 @@ void Player::Run() {
         DWORD flags = 0;
         LONGLONG ts = 0;
         ComPtr<IMFSample> sample;
-        HRESULT hr = reader_->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &sample);
+        HRESULT hr = ReadFrame(flags, ts, sample);
+        if (stop_) break;
         if (FAILED(hr)) {
             Log(L"Monitor %d: decode error 0x%08X", number_, hr);
             if (DeviceLost(hr)) break;

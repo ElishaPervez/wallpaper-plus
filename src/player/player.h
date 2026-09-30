@@ -45,7 +45,13 @@ public:
 
     Player(GpuSet& gpus, HMONITOR monitor, HWND surface, int width, int height, PlaybackSettings settings,
            HWND controller, int number);
-    ~Player();
+    ~Player();  // stops the thread and waits for it, however long that takes
+
+    // Asks the thread to stop without waiting, so several monitors can wind down at the same time.
+    // A file that's still opening, or a frame that's still being read, is given up on.
+    void RequestStop();
+    // Waits up to `ms` for the thread to finish; true once it has.
+    bool WaitStopped(DWORD ms);
 
     void Update(const PlaybackSettings& settings);
     void SetPaused(bool paused);
@@ -64,6 +70,7 @@ private:
         LONG stride = 0;  // bytes per row of processor-decoded frames
     };
     enum class Shown { Ok, Failed, DeviceLost };
+    class Reads;  // answers of the asynchronous reader_ (player.cpp)
 
     void Run();
     void Apply(const PlaybackSettings& next, bool first);
@@ -81,6 +88,7 @@ private:
     // not the decoder's fault, so no fallback: the controller is told to rebuild and the thread stops.
     bool DeviceLost(HRESULT hr = S_OK);
     bool OpenReader(const std::wstring& path, bool hardware);
+    HRESULT ReadFrame(DWORD& flags, LONGLONG& ts, ComPtr<IMFSample>& sample);  // E_ABORT on stop
     bool ReadFormat();
     bool ConfigureOutput();  // everything that depends on format, fit and brightness
     bool ConfigureProcessor();
@@ -123,6 +131,7 @@ private:
 
     ComPtr<IDXGISwapChain1> swap_;
     ComPtr<IMFSourceReader> reader_;
+    ComPtr<Reads> reads_;  // reader_'s callback
     ComPtr<ID3D11VideoProcessorEnumerator> vpEnum_;
     ComPtr<ID3D11VideoProcessor> vp_;
     ComPtr<ID3D11VideoProcessorOutputView> outView_;
@@ -154,6 +163,7 @@ private:
     std::optional<PlaybackSettings> pending_;
     std::wstring status_;  // guarded by pendingMutex_
     HANDLE wake_ = nullptr;   // auto-reset: pause/resume/stop/new settings
+    HANDLE stopEvent_ = nullptr;  // manual reset: set once stop is requested
     HANDLE timer_ = nullptr;  // high-resolution waitable timer for frame pacing
     std::atomic<bool> paused_{false};
     std::atomic<bool> stop_{false};

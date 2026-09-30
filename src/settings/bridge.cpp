@@ -79,11 +79,14 @@ static std::runtime_error SaveError(const char* what, const std::wstring& path) 
     return std::runtime_error("Couldn't save " + std::string(what) + " to " + Utf8(path) + reason);
 }
 
+// Videos in a folder and its subfolders, 4 levels deep. Stops after 2,000 videos, or 20,000 files
+// and folders looked at, so a huge tree (or a slow network drive) can't keep it busy for long.
 static std::vector<std::wstring> ScanFolder(const std::wstring& folder) {
     std::vector<std::wstring> out;
     std::error_code ec;
     fs::recursive_directory_iterator it(folder, fs::directory_options::skip_permission_denied, ec), end;
-    for (; !ec && it != end && out.size() < 2000; it.increment(ec)) {
+    size_t walked = 0;
+    for (; !ec && it != end && out.size() < 2000 && walked < 20000; it.increment(ec), ++walked) {
         if (it.depth() > 3) it.disable_recursion_pending();
         if (it->is_regular_file(ec) && IsVideo(it->path())) out.push_back(it->path().wstring());
     }
@@ -104,15 +107,19 @@ static std::wstring CacheName(const std::string& path) {
 }
 
 // Keeps the cache from growing forever: past 400 MB, the oldest files go until it's under 300 MB.
-// Leftover partial files from an interrupted run are removed too.
-static void PruneCache(const std::wstring& dir) {
+// Runs when the window opens (then also removing partial files an interrupted run left behind),
+// and again during the session each time another 50 MB has been downloaded.
+static void PruneCache(const std::wstring& dir, bool leftovers) {
     struct Entry { fs::file_time_type time; uintmax_t size; fs::path path; };
     std::vector<Entry> files;
     uintmax_t total = 0;
     std::error_code ec;
     for (auto& e : fs::directory_iterator(dir, ec)) {
         if (!e.is_regular_file(ec)) continue;
-        if (e.path().extension() == L".part") { fs::remove(e.path(), ec); continue; }
+        if (e.path().extension() == L".part") {  // still downloading, unless left over
+            if (leftovers) fs::remove(e.path(), ec);
+            continue;
+        }
         uintmax_t size = e.file_size(ec);
         files.push_back({e.last_write_time(ec), size, e.path()});
         total += size;
@@ -124,6 +131,12 @@ static void PruneCache(const std::wstring& dir) {
         if (fs::remove(f.path, ec)) total -= f.size;
     }
 }
+
+static constexpr uint64_t kMaxImageBytes = 4ull << 20;  // a thumbnail is ~100 KB
+static constexpr uint64_t kMaxClipBytes = 32ull << 20;  // a preview clip a few MB
+static constexpr ULONGLONG kMediaTimeLimitMs = 120000;  // per thumbnail or clip, start to finish
+static constexpr uint64_t kPruneEvery = 50ull << 20;
+static std::atomic<uint64_t> g_cacheGrowth{0};          // downloaded into the cache since the last prune
 
 static std::wstring VideosFolder() {
     PWSTR videos = nullptr;
@@ -140,6 +153,13 @@ static std::wstring SafeFileName(const std::wstring& name) {
         if (iswalnum(c) || c == L'.' || c == L'-' || c == L'_') out += c;
     while (!out.empty() && out[0] == L'.') out.erase(0, 1);
     return out.size() > 150 ? out.substr(out.size() - 150) : out;
+}
+
+// Sends a message to the page from a background thread: it travels through the window's message
+// queue (see Deliver). Once the window is gone, it's dropped.
+static void PostToPage(HWND hwnd, const json& message) {
+    auto* text = new std::string(message.dump(-1, ' ', false, json::error_handler_t::replace));
+    if (!PostMessageW(hwnd, WM_APP_BRIDGE, 0, reinterpret_cast<LPARAM>(text))) delete text;
 }
 
 // ---------- config <-> json ----------
@@ -291,7 +311,7 @@ void Bridge::Attach(HWND hwnd, ICoreWebView2* webview, const std::wstring& exeDi
     }
     fetches_.Push(9, "prune", [dir = webCacheDir_](bool cancelled) {
         if (cancelled) return;
-        PruneCache(dir);
+        PruneCache(dir, true);
         // Downloads cut off by closing the window leave a partial file behind.
         std::error_code ec;
         for (auto& e : fs::directory_iterator(VideosFolder() + L"\\Wallpaper Plus", ec))
@@ -404,7 +424,7 @@ HRESULT Bridge::OnMessage(ICoreWebView2WebMessageReceivedEventArgs* args) {
 
     std::string cmd = msg.value("cmd", "");
     if (cmd == "drop") {  // files dragged onto the window arrive as attached objects
-        json paths = json::array();
+        std::vector<std::wstring> dropped;
         ComPtr<ICoreWebView2WebMessageReceivedEventArgs2> args2;
         ComPtr<ICoreWebView2ObjectCollectionView> objects;
         UINT count = 0;
@@ -416,17 +436,36 @@ HRESULT Bridge::OnMessage(ICoreWebView2WebMessageReceivedEventArgs* args) {
                 LPWSTR path = nullptr;
                 if (SUCCEEDED(objects->GetValueAtIndex(i, &obj)) && SUCCEEDED(obj.As(&file)) &&
                     SUCCEEDED(file->get_Path(&path))) {
+                    dropped.push_back(path);
+                    CoTaskMemFree(path);
+                }
+            }
+        }
+        // Looked at in the background, like the library's files (see HandleFiles).
+        files_.Push(0, "", [hwnd = hwnd_, dropped](bool) {
+            json paths = json::array();
+            try {
+                for (auto& path : dropped) {
                     std::error_code ec;
                     if (fs::is_directory(path, ec)) {
                         for (auto& v : ScanFolder(path)) paths.push_back(Utf8(v));
                     } else if (IsVideo(path)) {
                         paths.push_back(Utf8(path));
                     }
-                    CoTaskMemFree(path);
                 }
+            } catch (const std::exception&) {
             }
+            PostToPage(hwnd, {{"event", "dropped"}, {"data", paths}});
+        });
+        return S_OK;
+    }
+
+    if (cmd == "statFiles" || cmd == "scanFolders" || cmd == "pickFolder") {
+        try {
+            HandleFiles(msg.value("id", json()), cmd, msg.value("args", json::object()));
+        } catch (const std::exception& e) {
+            Send({{"id", msg.value("id", json())}, {"error", e.what()}});
         }
-        Send({{"event", "dropped"}, {"data", paths}});
         return S_OK;
     }
 
@@ -486,30 +525,9 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
             out.push_back(Utf8(p));
         return out;
     }
-    if (cmd == "pickFolder") {
-        auto picked = OpenDialog(hwnd_, true, false, nullptr, nullptr);
-        if (picked.empty()) return nullptr;
-        json videos = json::array();
-        for (auto& v : ScanFolder(picked[0])) videos.push_back(Utf8(v));
-        return {{"folder", Utf8(picked[0])}, {"videos", videos}};
-    }
-    if (cmd == "scanFolders") {
-        json out = json::array();
-        for (auto& folder : args.at("folders"))
-            for (auto& v : ScanFolder(Wide(folder.get<std::string>()))) out.push_back(Utf8(v));
-        return out;
-    }
     if (cmd == "mediaUrls") {
         json out = json::array();
         for (auto& p : args.at("paths")) out.push_back(MediaUrl(Wide(p.get<std::string>())));
-        return out;
-    }
-    if (cmd == "statFiles") {
-        json out = json::array();
-        for (auto& p : args.at("paths")) {
-            std::error_code ec;
-            out.push_back(fs::is_regular_file(Wide(p.get<std::string>()), ec));
-        }
         return out;
     }
     if (cmd == "saveThumb") {
@@ -611,6 +629,72 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
     throw std::runtime_error("unknown command: " + cmd);
 }
 
+// ---------- library files ----------
+//
+// statFiles   {paths}   -> [bool]  does each library file still exist
+// scanFolders {folders} -> [path]  videos in the library's folders
+// pickFolder            -> {folder, videos} or null
+//
+// These touch the user's files, which may sit on a network drive that has stopped answering (then
+// Windows can take half a minute or more per path). So the work runs on files_ and the answer
+// arrives later, like the web.* commands'; the window stays responsive meanwhile.
+void Bridge::HandleFiles(const json& id, const std::string& cmd, const json& args) {
+    auto later = [this, id](std::function<json()> work) {
+        files_.Push(0, "", [hwnd = hwnd_, id, work = std::move(work)](bool) {
+            json reply = {{"id", id}};
+            try {
+                reply["result"] = work();
+            } catch (const std::exception& e) {
+                reply["error"] = e.what();
+            }
+            PostToPage(hwnd, reply);
+        });
+    };
+
+    if (cmd == "statFiles") {
+        std::vector<std::wstring> paths;
+        for (auto& p : args.at("paths")) paths.push_back(Wide(p.get<std::string>()));
+        return later([paths] {
+            json out = json::array();
+            // A drive or share that failed slowly once isn't asked again: one wait per drive, not
+            // one per file on it. (A file that's simply not there fails fast and without an error.)
+            std::vector<std::wstring> unreachable;
+            for (auto& p : paths) {
+                const std::wstring root = Lower(fs::path(p).root_path().wstring());
+                if (std::find(unreachable.begin(), unreachable.end(), root) != unreachable.end()) {
+                    out.push_back(false);
+                    continue;
+                }
+                const ULONGLONG started = GetTickCount64();
+                std::error_code ec;
+                out.push_back(fs::is_regular_file(p, ec));
+                if (ec && GetTickCount64() - started > 2000) unreachable.push_back(root);
+            }
+            return out;
+        });
+    }
+    if (cmd == "scanFolders") {
+        std::vector<std::wstring> folders;
+        for (auto& folder : args.at("folders")) folders.push_back(Wide(folder.get<std::string>()));
+        return later([folders] {
+            json out = json::array();
+            for (auto& folder : folders)
+                for (auto& v : ScanFolder(folder)) out.push_back(Utf8(v));
+            return out;
+        });
+    }
+    if (cmd == "pickFolder") {  // the dialog belongs to the window; only the scan moves off it
+        auto picked = OpenDialog(hwnd_, true, false, nullptr, nullptr);
+        if (picked.empty()) return Send({{"id", id}, {"result", nullptr}});
+        return later([folder = picked[0]] {
+            json videos = json::array();
+            for (auto& v : ScanFolder(folder)) videos.push_back(Utf8(v));
+            return json{{"folder", Utf8(folder)}, {"videos", videos}};
+        });
+    }
+    throw std::runtime_error("unknown command: " + cmd);
+}
+
 // ---------- browse (motionbgs.com) ----------
 //
 // web.page     {path}          -> {status, url, html}   a listing or search page, as text
@@ -621,10 +705,7 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
 // web.cancelDownload {id}
 void Bridge::HandleWeb(const json& id, const std::string& cmd, const json& args) {
     // Replies from worker threads travel through the window's message queue (see Deliver).
-    auto post = [hwnd = hwnd_](const json& message) {
-        auto* text = new std::string(message.dump(-1, ' ', false, json::error_handler_t::replace));
-        if (!PostMessageW(hwnd, WM_APP_BRIDGE, 0, reinterpret_cast<LPARAM>(text))) delete text;
-    };
+    auto post = [hwnd = hwnd_](const json& message) { PostToPage(hwnd, message); };
     auto fail = [post, id](const std::string& error) { post({{"id", id}, {"error", error}}); };
 
     if (cmd == "web.page") {
@@ -660,22 +741,40 @@ void Bridge::HandleWeb(const json& id, const std::string& cmd, const json& args)
         if (fs::file_size(file, ec) > 0 && !ec) return Send({{"id", id}, {"result", url}});
         const bool clip = path.size() > 4 && path.compare(path.size() - 4, 4, ".mp4") == 0;
         const int priority = args.value("urgent", false) ? 0 : clip ? 2 : 1;  // urgent: the clip being hovered
-        fetches_.Push(priority, group, [path, file, url, post, fail, id](bool cancelled) {
+        // Anything far bigger than a thumbnail or preview clip should be, or slower than any real
+        // one, is given up on and its partial file deleted.
+        const uint64_t cap = clip ? kMaxClipBytes : kMaxImageBytes;
+        fetches_.Push(priority, group, [path, file, url, post, fail, id, cap, dir = webCacheDir_](bool cancelled) {
             if (cancelled) return fail("cancelled");
             std::wstring part = file + L"." + std::to_wstring(GetCurrentThreadId()) + L".part";
             try {
+                const ULONGLONG started = GetTickCount64();
+                uint64_t received = 0;
+                bool tooBig = false, tooSlow = false;
                 web::Response res;
                 {
                     std::ofstream out(part, std::ios::binary | std::ios::trunc);
-                    res = web::Get(Wide(path), [&](const char* data, size_t n) {
-                        out.write(data, (std::streamsize)n);
-                        return (bool)out;
-                    });
+                    res = web::Get(
+                        Wide(path),
+                        [&](const char* data, size_t n) {
+                            received += n;
+                            tooBig = tooBig || received > cap;
+                            tooSlow = GetTickCount64() - started > kMediaTimeLimitMs;
+                            if (tooBig || tooSlow) return false;
+                            out.write(data, (std::streamsize)n);
+                            return (bool)out;
+                        },
+                        [&](const web::Response& head) { tooBig = head.length > cap; });
                     if (!out) throw std::runtime_error("cache write failed");
                 }
+                if (tooBig) throw std::runtime_error("too large");
+                if (tooSlow) throw std::runtime_error("took too long");
                 if (res.status != 200) throw std::runtime_error("not available");
                 if (!MoveFileExW(part.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING)) throw std::runtime_error("cache write failed");
                 post({{"id", id}, {"result", url}});
+                // Whichever thread brings the total past the mark trims the cache; nobody waits on it.
+                if (g_cacheGrowth.fetch_add(received) + received >= kPruneEvery && g_cacheGrowth.exchange(0) >= kPruneEvery)
+                    PruneCache(dir, false);
             } catch (const std::exception& e) {
                 DeleteFileW(part.c_str());
                 fail(e.what());
@@ -731,9 +830,20 @@ void Bridge::HandleWeb(const json& id, const std::string& cmd, const json& args)
                 if (res.length && received != res.length) throw std::runtime_error("The download was cut short");
                 std::wstring name = SafeFileName(res.filename);
                 if (name.size() < 5 || !IsVideo(name)) name = L"wallpaper-" + Wide(wallpaper) + L"-" + Wide(quality) + L".mp4";
-                std::wstring target = folder + L"\\" + name;
-                if (!MoveFileExW(part.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING))
-                    throw std::runtime_error("Couldn't save the file");
+                // Never over an existing file (two wallpapers can clean up to the same name): a taken
+                // name gets the wallpaper's number added, then a counter. Moving without "replace"
+                // fails when the name is taken, so nothing can slip in between check and move.
+                const fs::path named(name);
+                std::wstring target;
+                bool saved = false;
+                for (int n = 0; n < 100 && !saved; ++n) {
+                    const std::wstring suffix = n == 0 ? L"" : L"-" + Wide(wallpaper) + (n > 1 ? L"-" + std::to_wstring(n) : L"");
+                    target = folder + L"\\" + named.stem().wstring() + suffix + named.extension().wstring();
+                    saved = MoveFileExW(part.c_str(), target.c_str(), 0) != 0;
+                    const DWORD error = saved ? 0 : GetLastError();
+                    if (!saved && error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) break;
+                }
+                if (!saved) throw std::runtime_error("Couldn't save the file");
                 post({{"id", id}, {"result", {{"path", Utf8(target)}}}});
             } catch (const std::exception& e) {
                 DeleteFileW(part.c_str());

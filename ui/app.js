@@ -158,13 +158,19 @@ function addPaths(paths, { fromFolderScan = false } = {}) {
   return added;
 }
 
+// The host answers these from a background thread, which can take a while when a saved path is on
+// a network drive that stopped answering. The page stays usable meanwhile, so the answers are
+// applied to what's still there: items removed since are left out, and so are folders.
 async function refreshLibraryFiles() {
-  const items = state.library.items;
+  const items = [...state.library.items];
   if (items.length) {
     const exists = await rpc('statFiles', { paths: items.map((i) => i.path) });
     items.forEach((item, i) => { item.missing = !exists[i]; });
   }
-  if (state.library.folders.length) addPaths(await rpc('scanFolders', { folders: state.library.folders }), { fromFolderScan: true });
+  if (state.library.folders.length) {
+    const found = await rpc('scanFolders', { folders: state.library.folders });
+    addPaths(found.filter((p) => state.library.folders.some((f) => isInside(p, f))), { fromFolderScan: true });
+  }
 }
 
 // Thumbnails are captured here from the video itself and stored by the host as small JPEGs.
@@ -824,12 +830,14 @@ async function loadWebThumb(card) {
   const size = webThumbSize();
   const current = card.querySelector('.webcard__thumb');
   if (!w || current?.dataset.size === size || current?.dataset.size === '960x540') return; // never trade down
-  const url = await webMedia(`/i/c/${size}/media/${w.thumbFile}`).catch(() => null);
+  const path = `/i/c/${size}/media/${w.thumbFile}`;
+  const url = await webMedia(path).catch(() => null);
   if (!url || !card.isConnected) return;
   const img = new Image();
   img.alt = '';
   img.className = 'webcard__thumb';
   img.dataset.size = size;
+  img.onerror = () => webMediaUrls.delete(path); // trimmed from the cache meanwhile: fetch again next time
   img.onload = () => {
     img.classList.add('is-on');
     if (old) setTimeout(() => old.remove(), 360); // the sharper copy fades in over the old one
@@ -862,6 +870,7 @@ async function startWebPreview(card) {
   video.muted = true; video.loop = true; video.playsInline = true;
   video.className = 'webcard__video';
   video.addEventListener('playing', () => video.classList.add('is-on'), { once: true });
+  video.addEventListener('error', () => webMediaUrls.delete(w.preview), { once: true }); // see loadWebThumb
   video.src = url;
   card.querySelector('.card__media').insertBefore(video, card.querySelector('.webcard__tag'));
   video.play().catch(() => {});
@@ -894,6 +903,9 @@ async function webDownload(w, quality = bestQuality(w)) {
   refreshWebCard(w.id);
   try {
     const { path } = await rpc('web.download', { id: w.id, quality });
+    // The host never saves over an existing file, so an entry already at this path is left over
+    // from a video that was deleted: the new wallpaper gets a fresh entry in its place.
+    state.library.items = state.library.items.filter((i) => keyOf(i.path) !== keyOf(path));
     addPaths([path]);
     const item = itemByPath(path);
     item.name = w.title;
@@ -1445,11 +1457,11 @@ async function init() {
   const referenced = state.monitors.flatMap((m) => settingFor(m.number).videos);
   addPaths(referenced);
   render();
+  setInterval(pollPlayer, 4000);
 
   await refreshLibraryFiles().catch(() => {});
   render();
   queueThumbs();
-  setInterval(pollPlayer, 4000);
 }
 
 init().catch((e) => toast(`Couldn't load settings: ${e.message}`));

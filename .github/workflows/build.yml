@@ -19,19 +19,28 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false  # nothing later needs git access; keep the token out of .git
 
       # Puts cl, rc, fxc and link on PATH and sets VSCMD_VER, so build.bat skips its own
-      # Build Tools path.
-      - uses: ilammy/msvc-dev-cmd@v1
+      # Build Tools path. Third-party actions are pinned to a full commit, not a tag, which its
+      # owner could move to other code; to update, look up the new tag's commit and review it.
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
 
+      # Always this exact version (the runner image may come with another one). Chocolatey checks
+      # the download against the checksum recorded in that package version.
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
-            choco install innosetup -y --no-progress
-          }
+          $version = '6.7.1'
+          choco upgrade innosetup --version=$version --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $keys = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1',
+                  'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 6_is1'
+          $installed = (Get-ItemProperty $keys -ErrorAction SilentlyContinue | Select-Object -First 1).DisplayVersion
+          if ($installed -ne $version) { throw "Inno Setup $installed is installed, expected $version" }
 
       - name: Build
         shell: cmd
@@ -71,7 +80,7 @@ jobs:
         with:
           name: WallpaperPlus-Setup-${{ needs.build.outputs.version }}
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: Wallpaper Plus ${{ needs.build.outputs.version }}
           files: WallpaperPlus-Setup-${{ needs.build.outputs.version }}.exe

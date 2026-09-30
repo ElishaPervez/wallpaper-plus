@@ -1,6 +1,11 @@
 #include "desktop_layer.h"
 #include "log.h"
 
+#include <shobjidl.h>
+#include <wrl/client.h>
+
+using Microsoft::WRL::ComPtr;
+
 // Undocumented Progman message that makes Explorer create the WorkerW behind the icons.
 static constexpr UINT kSpawnWorkerW = 0x052C;
 
@@ -65,9 +70,42 @@ void RestoreStaticWallpaper(const DesktopLayer& layer) {
         RedrawWindow(layer.parent, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         return;
     }
-    // Classic layout: the WorkerW doesn't repaint the wallpaper by itself. Re-applying the current
-    // wallpaper path makes Explorer redraw it.
-    wchar_t path[MAX_PATH] = {};
-    if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, path, 0))
-        SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, path, 0);
+    // Classic layout: the WorkerW doesn't repaint the wallpaper by itself; Explorer redraws it when a
+    // wallpaper is applied. Each monitor gets back the picture it already has (applying one path to
+    // the whole desktop would put the same picture on every monitor and end a slideshow), and a
+    // slideshow is just moved on to its next picture, so it keeps running.
+    ComPtr<IDesktopWallpaper> wallpaper;
+    if (FAILED(CoCreateInstance(__uuidof(DesktopWallpaper), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wallpaper)))) {
+        Log(L"Desktop: can't reach the wallpaper settings; the last video frame may stay until the wallpaper changes");
+        return;
+    }
+    DESKTOP_SLIDESHOW_STATE state = {};
+    if (SUCCEEDED(wallpaper->GetStatus(&state)) && (state & DSS_ENABLED) && (state & DSS_SLIDESHOW)) {
+        wallpaper->AdvanceSlideshow(nullptr, DSD_FORWARD);
+        return;
+    }
+    // One picture on every monitor (also a picture spanned across them) answers for "all monitors";
+    // different pictures per monitor answer S_FALSE there and are applied one by one.
+    LPWSTR shared = nullptr;
+    bool applied = wallpaper->GetWallpaper(nullptr, &shared) == S_OK && shared && *shared &&
+                   SUCCEEDED(wallpaper->SetWallpaper(nullptr, shared));
+    CoTaskMemFree(shared);
+    UINT count = 0;
+    if (!applied) wallpaper->GetMonitorDevicePathCount(&count);
+    for (UINT i = 0; i < count; ++i) {
+        LPWSTR monitor = nullptr, path = nullptr;
+        RECT r;
+        if (SUCCEEDED(wallpaper->GetMonitorDevicePathAt(i, &monitor)) &&
+            SUCCEEDED(wallpaper->GetMonitorRECT(monitor, &r)) &&  // fails for monitors that aren't connected
+            SUCCEEDED(wallpaper->GetWallpaper(monitor, &path)) && path && *path)
+            applied = SUCCEEDED(wallpaper->SetWallpaper(monitor, path)) || applied;
+        CoTaskMemFree(path);
+        CoTaskMemFree(monitor);
+    }
+    // No picture anywhere: a solid color. Re-applying "no picture" repaints it and loses nothing.
+    if (!applied) {
+        wchar_t path[MAX_PATH] = {};
+        if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, MAX_PATH, path, 0) && !path[0])
+            SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, path, 0);
+    }
 }
