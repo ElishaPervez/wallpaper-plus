@@ -8,5 +8,5 @@
 __pycache__/
 *.pyc
 
-# Shareable zips (tools/make-release.sh)
+# Installers (tools/make-release.sh)
 /release/
