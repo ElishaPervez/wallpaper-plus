@@ -10,3 +10,12 @@ __pycache__/
 
 # Installers (tools/make-release.sh)
 /release/
+
+# Local notes and dev-only helpers, not part of the app
+/docs/
+/tools/cdp.mjs
+/tools/dev-restart.sh
+
+# Parts of the WebView2 SDK the build doesn't use (the settings window links the static loader)
+/third_party/webview2/build/native/x64/WebView2Loader.dll
+/third_party/webview2/build/native/x64/WebView2Loader.dll.lib
