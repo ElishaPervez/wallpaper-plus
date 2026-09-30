@@ -9,7 +9,8 @@ std::wstring ExeDirectory();
 //  - next to the exes (portable) when that folder already has a wallpaper.ini, or can be written;
 //  - otherwise %LOCALAPPDATA%\WallpaperPlus. That covers folders the user can't write to (Program
 //    Files, drive roots) and Windows Security's "Controlled folder access", which silently stops
-//    unsigned programs writing into Documents and Desktop.
+//    unsigned programs writing into Documents and Desktop. The first time, settings and library
+//    already next to the exes are copied there.
 // Computed once per process; the folder exists on return.
 const std::wstring& DataDirectory();
 

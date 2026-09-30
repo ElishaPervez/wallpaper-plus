@@ -60,8 +60,7 @@ bool GpuSet::Init(DecoderPreference pref) {
         ComPtr<IDXGIAdapter1> adapter;
         HRESULT hr = factory6 ? factory6->EnumAdapterByGpuPreference(i, order, IID_PPV_ARGS(&adapter))
                               : factory->EnumAdapters1(i, &adapter);
-        if (hr == DXGI_ERROR_NOT_FOUND) break;
-        if (FAILED(hr)) continue;
+        if (FAILED(hr)) break;  // DXGI_ERROR_NOT_FOUND after the last one; other errors would repeat forever
         DXGI_ADAPTER_DESC1 desc{};
         adapter->GetDesc1(&desc);
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;  // Microsoft Basic Render Driver: added last below
@@ -71,13 +70,15 @@ bool GpuSet::Init(DecoderPreference pref) {
         s.vendor = desc.VendorId;
         for (UINT o = 0;; ++o) {
             ComPtr<IDXGIOutput> output;
-            if (adapter->EnumOutputs(o, &output) == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(adapter->EnumOutputs(o, &output))) break;
             DXGI_OUTPUT_DESC od{};
-            if (output && SUCCEEDED(output->GetDesc(&od))) s.outputs.push_back(od.Monitor);
+            if (SUCCEEDED(output->GetDesc(&od))) s.outputs.push_back(od.Monitor);
         }
         slots_.push_back(std::move(s));
     }
-    if (pref == DecoderPreference::Auto)  // NVIDIA's decoder first, the rest keep the fastest-first order
+    // Automatic: after the GPU driving the monitor (see NextDecoder), NVIDIA's decoder first; the rest
+    // keep the fastest-first order.
+    if (pref == DecoderPreference::Auto)
         std::stable_partition(slots_.begin(), slots_.end(), [](const Slot& s) { return s.vendor == kVendorNvidia; });
     Slot software;
     software.name = L"Microsoft software renderer";
@@ -87,13 +88,15 @@ bool GpuSet::Init(DecoderPreference pref) {
         Log(L"GPU found: %s%s", s.name.c_str(), s.outputs.empty() ? L"" : L" (drives a monitor)");
     Log(L"Video decoding: %s", pref == DecoderPreference::Cpu           ? L"processor only"
                                : pref == DecoderPreference::PowerSaving ? L"integrated GPU first, then processor"
-                                                                        : L"NVIDIA first, then other GPUs, then processor");
+                                                                        : L"GPU driving the monitor first, then NVIDIA, then other GPUs, then processor");
 
-    // At least one device must work now, or the controller retries later.
+    // At least one device must work now, or the controller retries later. Tried on a GPU that
+    // drives a monitor (awake anyway), then the software renderer, so this check never wakes a
+    // laptop's NVIDIA chip and keeps it powered for the session when no video needs it.
     std::lock_guard lock(mutex_);
     for (auto& s : slots_)
-        if (Open(s)) return true;
-    return false;
+        if (s.adapter && !s.outputs.empty() && Open(s)) return true;
+    return Open(slots_.back()) != nullptr;
 }
 
 void GpuSet::Reset() {
@@ -177,14 +180,25 @@ Gpu* GpuSet::Open(Slot& s) {
     return s.gpu.get();
 }
 
-Gpu* GpuSet::NextDecoder(const VideoInfo& v, size_t& cursor) {
+Gpu* GpuSet::NextDecoder(const VideoInfo& v, HMONITOR monitor, size_t& cursor) {
     if (pref_ == DecoderPreference::Cpu) return nullptr;
     std::lock_guard lock(mutex_);
-    while (cursor < slots_.size()) {
-        Slot& s = slots_[cursor++];
+    // Automatic: the GPU driving this monitor first (awake anyway, and its frames need no copy to
+    // another GPU), then the stored ranking. On a PC with one GPU driving every monitor, that's
+    // the same order.
+    auto drives = [&](const Slot& s) {
+        return pref_ == DecoderPreference::Auto && std::find(s.outputs.begin(), s.outputs.end(), monitor) != s.outputs.end();
+    };
+    std::vector<Slot*> order;
+    for (auto& s : slots_)
+        if (drives(s)) order.push_back(&s);
+    for (auto& s : slots_)
+        if (!drives(s)) order.push_back(&s);
+    while (cursor < order.size()) {
+        Slot& s = *order[cursor++];
         if (!s.adapter) continue;  // the software renderer has no decoder
         Gpu* g = Open(s);
-        if (g && g->Decodes(v)) return g;
+        if (g && !g->Removed() && g->Decodes(v)) return g;
     }
     return nullptr;
 }

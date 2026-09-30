@@ -74,8 +74,12 @@ private:
     bool UseGpu(Gpu* gpu);  // moves the swap chain to this device if it isn't there already
     bool CreateSwapChain();
     bool OpenVideo(const std::wstring& path);
-    bool OpenNextDecoder(const std::wstring& path);  // next decoder in line for the current video
+    bool OpenNextDecoder(const std::wstring& path, bool bestOnly = false);  // next decoder in line for the current video
     bool FallBack();  // current decoder failed mid-video: restart it on the next decoder
+    bool RetryHardware();  // at a loop, after FallBack landed on the processor: best decoder again
+    // After a failure: true if it's because gpu_'s device was removed (or `hr` says so). Then it's
+    // not the decoder's fault, so no fallback: the controller is told to rebuild and the thread stops.
+    bool DeviceLost(HRESULT hr = S_OK);
     bool OpenReader(const std::wstring& path, bool hardware);
     bool ReadFormat();
     bool ConfigureOutput();  // everything that depends on format, fit and brightness
@@ -112,8 +116,10 @@ private:
     VideoInfo info_;      // current video, as read from the file
     size_t decoderCursor_ = 0;
     bool triedProcessor_ = false;
+    bool retryHardware_ = false;  // on the processor because a hardware decoder failed mid-video
     bool hardware_ = false;  // reader_ was given gpu_'s decoder
     int shownKind_ = 0;      // where frames arrive: 1 on the GPU, 2 in memory
+    bool deviceLost_ = false;  // reported to the controller; the thread is on its way out
 
     ComPtr<IDXGISwapChain1> swap_;
     ComPtr<IMFSourceReader> reader_;

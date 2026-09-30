@@ -26,20 +26,32 @@ Tray icon: click to open settings; right-click for *Pause wallpapers* and *Quit*
 Double-clicking `WallpaperPlus.exe` while it runs also opens settings.
 `WallpaperPlus.exe --quit` stops it from a script.
 
-Decoding: each video goes to the best decoder the PC has for it. *Automatic* tries NVIDIA's
-decoder first, then any other GPU (Intel/AMD), then the processor; *Power saving* tries the
-integrated GPU first so a laptop's discrete GPU can sleep; *Processor* always decodes on the
-processor. If a decoder can't take a video, or fails partway through, the video restarts on the
-next one down. On a PC with no working GPU (VMs, remote desktop, broken drivers), Windows' software
-renderer draws, so wallpapers still play, at a high processor cost. Settings shows which decoder
-each monitor is using.
+Decoding: each video goes to the best decoder the PC has for it. *Automatic* tries the GPU the
+monitor is plugged into first, then NVIDIA's decoder, then any other GPU (Intel/AMD), then the
+processor; *Power saving* tries the integrated GPU first so a laptop's discrete GPU can sleep;
+*Processor* always decodes on the processor. If a decoder can't take a video, or fails partway
+through, the video restarts on the next one down; a video that ended up on the processor because
+a GPU decoder failed partway through tries the best GPU decoder again each time it loops. On a PC
+with no working GPU (VMs, remote desktop, broken drivers), Windows' software renderer draws, so
+wallpapers still play, at a high processor cost. Settings shows which decoder each monitor is using.
 
 Formats: H.264 always works. HEVC and AV1 need Microsoft's "HEVC Video Extensions" /
 "AV1 Video Extension" from the Store. Wallpapers play without sound.
 
-Everything is stored next to the exe: `wallpaper.ini` (settings, hand-editable), `library.json`,
-`thumbs\`, `player-status.txt` (which decoder each monitor uses, written by the player), and
-`wallpaper-plus.log` (read this if something doesn't play).
+Data folder: `wallpaper.ini` (settings, hand-editable), `library.json`, `thumbs\`, `webcache\`
+(Browse tab downloads), `player-status.txt` (which decoder each monitor uses, written by the
+player), and `wallpaper-plus.log` (read this if something doesn't play). Both programs pick the
+same folder:
+
+1. next to the exe, if a `wallpaper.ini` is already there and the folder can be written;
+2. otherwise `%LOCALAPPDATA%\WallpaperPlus`, if a `wallpaper.ini` is already there;
+3. otherwise next to the exe, if it can be written and isn't inside the temp folder;
+4. otherwise `%LOCALAPPDATA%\WallpaperPlus` (Program Files, drive roots, folders blocked by
+   Windows Security's "Controlled folder access"). The first time, the settings, library and
+   thumbnails already next to the exe are copied there; nothing already there is overwritten.
+
+The settings window always keeps its browser cache in `%LOCALAPPDATA%\WallpaperPlus\WebView2`.
+Started straight from inside a zip, the player refuses to run and asks for the zip to be extracted.
 
 ## Build
 

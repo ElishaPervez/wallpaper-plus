@@ -976,7 +976,7 @@ document.addEventListener('visibilitychange', () => {
 
 const decoders = [['auto', 'Automatic'], ['power_saving', 'Power saving'], ['cpu', 'Processor']];
 const decoderHelp = {
-  auto: 'Uses the NVIDIA decoder if there is one, then any other GPU, then the processor.',
+  auto: 'Uses the GPU the monitor is plugged into if it can decode the video, then NVIDIA, then any other GPU, then the processor.',
   power_saving: 'Uses the integrated GPU first, so a laptop\'s NVIDIA or AMD chip can stay asleep.',
   cpu: 'Decodes on the processor and only draws on the GPU. Uses much more processor time; for troubleshooting.',
 };

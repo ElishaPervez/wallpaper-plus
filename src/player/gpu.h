@@ -42,6 +42,9 @@ struct Gpu {
     bool software = false;  // Microsoft's software renderer (no usable GPU)
 
     bool CanHardwareDecode() const { return dxgiManager != nullptr; }
+    // True once the device is gone (driver update or crash, GPU reset, eGPU unplugged): every call
+    // on it fails from then on, until the controller rebuilds everything on fresh devices.
+    bool Removed() const { return device->GetDeviceRemovedReason() != S_OK; }
     // True if this GPU's decoder handles the video's codec, size and bit depth. Unknown codecs
     // answer true: Media Foundation gets to try, and the player checks what it actually got.
     bool Decodes(const VideoInfo& v) const;
@@ -55,10 +58,11 @@ public:
     bool Init(DecoderPreference pref);  // false if no device at all could be created
     void Reset();
 
-    // The next hardware decoder that can take this video, best first, starting from `cursor`
-    // (which it advances). Null when none is left, or always in "processor only" mode. Lazy, so
-    // lower-ranked GPUs are only woken if the better ones can't decode the video.
-    Gpu* NextDecoder(const VideoInfo& v, size_t& cursor);
+    // The next hardware decoder that can take this video on this monitor, best first, starting from
+    // `cursor` (which it advances). Automatic puts the GPU that drives the monitor first. Null when
+    // none is left, or always in "processor only" mode. Lazy, so lower-ranked GPUs are only woken
+    // if the better ones can't decode the video.
+    Gpu* NextDecoder(const VideoInfo& v, HMONITOR monitor, size_t& cursor);
     // Where to draw processor-decoded frames for a monitor: the GPU that drives it if possible,
     // otherwise any GPU, otherwise the software renderer.
     Gpu* RendererFor(HMONITOR monitor);

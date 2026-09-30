@@ -159,18 +159,22 @@ bool Player::OpenVideo(const std::wstring& path) {
     }
     decoderCursor_ = 0;
     triedProcessor_ = false;
+    retryHardware_ = false;
     if (OpenNextDecoder(path)) return true;
+    if (deviceLost_) return false;
     Log(L"Monitor %d: nothing on this PC can decode %s (%s). HEVC/AV1 need the Microsoft Store codec extensions.",
         number_, path.c_str(), CodecName(info_.codec));
     return false;
 }
 
 // Tries the remaining decoders for the current video in order: each GPU that says it handles the
-// codec, then the processor.
-bool Player::OpenNextDecoder(const std::wstring& path) {
+// codec, then the processor. With `bestOnly`, only the first GPU, then the processor (right away,
+// or when that GPU fails later on).
+bool Player::OpenNextDecoder(const std::wstring& path, bool bestOnly) {
     for (;;) {
-        Gpu* gpu = gpus_.NextDecoder(info_, decoderCursor_);
+        Gpu* gpu = gpus_.NextDecoder(info_, monitor_, decoderCursor_);
         const bool hardware = gpu != nullptr;
+        if (hardware && bestOnly) decoderCursor_ = SIZE_MAX;
         if (!gpu) {
             if (triedProcessor_) return false;
             triedProcessor_ = true;
@@ -187,8 +191,18 @@ bool Player::OpenNextDecoder(const std::wstring& path) {
             return true;
         }
         reader_.Reset();
+        if (DeviceLost()) return false;
         if (hardware) Log(L"Monitor %d: %s's decoder won't take this video; trying the next option", number_, gpu->name.c_str());
     }
+}
+
+bool Player::DeviceLost(HRESULT hr) {
+    if (deviceLost_) return true;
+    if (!gpu_ || (hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET && !gpu_->Removed())) return false;
+    Log(L"Monitor %d: GPU device lost (0x%08X)", number_, gpu_->device->GetDeviceRemovedReason());
+    deviceLost_ = true;
+    PostMessageW(controller_, WM_APP_DEVICE_LOST, 0, 0);
+    return true;
 }
 
 bool Player::FallBack() {
@@ -196,9 +210,24 @@ bool Player::FallBack() {
     const std::wstring& path = cur_.monitor.videos[index_];
     Log(L"Monitor %d: %s stopped decoding %s; switching decoder", number_,
         hardware_ ? gpu_->name.c_str() : L"the processor", path.c_str());
+    const bool wasHardware = hardware_;
     reader_.Reset();
     if (!OpenNextDecoder(path)) return false;
+    if (wasHardware && !hardware_) retryHardware_ = true;
+    const LONGLONG played = loopBase_;
     ResetClock();
+    loopBase_ = played;  // keeps the playlist's rotation timer going
+    return true;
+}
+
+bool Player::RetryHardware() {
+    const std::wstring& path = cur_.monitor.videos[index_];
+    Log(L"Monitor %d: trying hardware decoding of %s again", number_, path.c_str());
+    reader_.Reset();
+    decoderCursor_ = 0;
+    triedProcessor_ = false;
+    if (!OpenNextDecoder(path, true)) return false;
+    retryHardware_ = !hardware_;  // still on the processor: again at the next loop
     return true;
 }
 
@@ -636,13 +665,11 @@ Player::Shown Player::Present(IMFSample* sample) {
     if (FAILED(sample->GetBufferByIndex(0, &buffer))) return Shown::Failed;
     ComPtr<IMFDXGIBuffer> dxgiBuffer;
     const bool onGpu = SUCCEEDED(buffer.As(&dxgiBuffer));
-    if (!(onGpu ? BlitGpuFrame(dxgiBuffer.Get()) : DrawMemoryFrame(sample))) return Shown::Failed;
+    if (!(onGpu ? BlitGpuFrame(dxgiBuffer.Get()) : DrawMemoryFrame(sample)))
+        return DeviceLost() ? Shown::DeviceLost : Shown::Failed;
 
     HRESULT hr = swap_->Present(1, 0);
-    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-        Log(L"Monitor %d: GPU device lost (0x%08X)", number_, gpu_->device->GetDeviceRemovedReason());
-        return Shown::DeviceLost;
-    }
+    if (DeviceLost(hr)) return Shown::DeviceLost;
     const int kind = onGpu ? 1 : 2;
     if (kind != shownKind_) {  // Windows gave the "hardware" reader a software decoder after all
         shownKind_ = kind;
@@ -688,6 +715,7 @@ bool Player::OpenCurrent() {
             visible_ = true;
             return true;
         }
+        if (deviceLost_) return false;  // not this video's fault: the rebuild starts over
         index_ = (index_ + 1) % videos.size();  // skip unplayable entries
     }
     reader_.Reset();
@@ -712,6 +740,7 @@ void Player::NextVideo() {
 
 void Player::SkipBroken() {
     reader_.Reset();
+    if (deviceLost_) return;  // not this video's fault: the rebuild starts over
     const size_t n = cur_.monitor.videos.size();
     if (n > 1 && ++failStreak_ < n) {  // try the next entry, but give up after one full lap
         NextVideo();
@@ -746,8 +775,8 @@ void Player::Apply(const PlaybackSettings& next, bool first) {
         } else {
             OpenCurrent();
         }
-    } else if (lookChanged && reader_) {
-        ConfigureOutput();
+    } else if (lookChanged && reader_ && !ConfigureOutput()) {
+        DeviceLost();
     }
     haveClock_ = false;  // speed or frame cap may have changed: re-anchor timing at the next frame
     capNext_ = -1;
@@ -759,7 +788,7 @@ void Player::Run() {
 
     bool first = true;  // the swap chain is created when the first video picks its GPU
 
-    while (!stop_) {
+    while (!stop_ && !deviceLost_) {
         std::optional<PlaybackSettings> next;
         {
             std::lock_guard lock(pendingMutex_);
@@ -768,6 +797,7 @@ void Player::Run() {
         if (next) {
             Apply(*next, first);
             first = false;
+            if (deviceLost_) break;
         }
 
         if (!reader_ || paused_) {
@@ -782,6 +812,7 @@ void Player::Run() {
         HRESULT hr = reader_->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &sample);
         if (FAILED(hr)) {
             Log(L"Monitor %d: decode error 0x%08X", number_, hr);
+            if (DeviceLost(hr)) break;
             if (!FallBack()) SkipBroken();
             continue;
         }
@@ -806,7 +837,14 @@ void Player::Run() {
             }
             streamStart_ = -1;
             framesThisPass_ = false;
+            // On the processor since a hardware decoder failed mid-video: give the GPUs one more try
+            // per loop (its fresh reader starts at the beginning, so no seek). The clock carries on.
+            if (retryHardware_) {
+                if (!RetryHardware()) SkipBroken();
+                continue;
+            }
             if (!SeekToStart()) {
+                if (DeviceLost()) break;
                 Log(L"Monitor %d: can't loop (seek failed)", number_);
                 reader_.Reset();
             }
@@ -814,6 +852,7 @@ void Player::Run() {
         }
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
             if (!ReadFormat() || !ConfigureOutput()) {
+                if (DeviceLost()) break;
                 if (!FallBack()) SkipBroken();
                 continue;
             }
@@ -863,10 +902,7 @@ void Player::Run() {
         }
 
         const Shown shown = Present(sample.Get());
-        if (shown == Shown::DeviceLost) {
-            PostMessageW(controller_, WM_APP_DEVICE_LOST, 0, 0);
-            break;
-        }
+        if (shown == Shown::DeviceLost) break;  // the controller was told and rebuilds everything
         if (shown == Shown::Failed) {  // this decoder's frames can't be drawn: try the next decoder
             if (!FallBack()) SkipBroken();
             continue;

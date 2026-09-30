@@ -7,7 +7,7 @@ enum class FitMode { Fill, Fit, Stretch };
 
 // Which chip decodes the videos. Whatever is chosen, a video the chosen chip can't handle falls
 // through to the next one, ending with the processor, so something always plays.
-//  Auto: NVIDIA's decoder first, then other GPUs (fastest first), then the processor.
+//  Auto: the GPU driving the monitor first, then NVIDIA's decoder, then other GPUs (fastest first), then the processor.
 //  PowerSaving: integrated GPU first (keeps a laptop's discrete GPU asleep), then others, then the processor.
 //  Cpu: always decode on the processor; the GPU only draws.
 enum class DecoderPreference { Auto, PowerSaving, Cpu };

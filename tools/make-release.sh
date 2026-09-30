@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 # Builds a shareable zip: release\WallpaperPlus-<commit>.zip holding the two programs, the
 # settings UI and a short readme. Nothing from build\ that's personal (settings, library,
-# thumbnails, logs) goes in. Both programs must be closed first, or the build can't replace them.
-set -e
+# thumbnails, logs) goes in. A running player is asked to quit so the build can replace its exe;
+# close the settings window yourself first.
+set -eo pipefail
 cd "$(dirname "$0")/.."
-powershell -NoProfile -Command "& '.\build.bat'" 2>&1 | grep -E "error|warning|Build OK"
+if [ -f build/WallpaperPlus.exe ]; then
+    build/WallpaperPlus.exe --quit
+    sleep 2  # it exits once it has put the normal wallpaper back
+fi
+# Only build.bat's closing "Build OK" counts: otherwise build\ still holds the previous exes.
+out=$(powershell -NoProfile -Command "& '.\build.bat'" 2>&1) || true
+if ! grep -q "Build OK" <<<"$out"; then
+    echo "$out" >&2
+    echo "Build failed (see above); no release made." >&2
+    exit 1
+fi
+grep -E "error|warning|Build OK" <<<"$out"
 rm -f build/obj/*/*.obj
 
 version=$(git rev-parse --short HEAD)

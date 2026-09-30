@@ -71,6 +71,32 @@ bool RefuseToRunFromArchive() {
     return true;
 }
 
+// Copies src to dst unless dst exists, through a temporary name: the other program starting at the
+// same moment never reads a half-copied file, and whichever copy lands first wins. Failure is harmless.
+static void CopyIfMissing(const std::wstring& src, const std::wstring& dst) {
+    if (!FileExists(src) || FileExists(dst)) return;
+    const std::wstring tmp = dst + L".copy-" + std::to_wstring(GetCurrentProcessId());
+    if (CopyFileW(src.c_str(), tmp.c_str(), FALSE) && MoveFileExW(tmp.c_str(), dst.c_str(), 0)) return;
+    DeleteFileW(tmp.c_str());
+}
+
+// First run in %LOCALAPPDATA%: brings along the settings and library already next to the exes, so
+// they don't seem to vanish. Nothing there is overwritten. wallpaper.ini goes last: once it's
+// there, this never runs again (and Pick keeps choosing this folder).
+static void CopyInSettings(const std::wstring& from, const std::wstring& to) {
+    if (FileExists(to + L"\\wallpaper.ini")) return;
+    CopyIfMissing(from + L"\\library.json", to + L"\\library.json");
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW((from + L"\\thumbs\\*.jpg").c_str(), &fd);  // the library's thumbnails
+    if (find != INVALID_HANDLE_VALUE) {
+        CreateDirectoryW((to + L"\\thumbs").c_str(), nullptr);
+        do CopyIfMissing(from + L"\\thumbs\\" + fd.cFileName, to + L"\\thumbs\\" + fd.cFileName);
+        while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    CopyIfMissing(from + L"\\wallpaper.ini", to + L"\\wallpaper.ini");
+}
+
 static std::wstring Pick() {
     const std::wstring exeDir = ExeDirectory();
     wchar_t local[MAX_PATH] = {};
@@ -88,6 +114,7 @@ const std::wstring& DataDirectory() {
     static const std::wstring dir = [] {
         std::wstring d = Pick();
         CreateDirectoryW(d.c_str(), nullptr);  // no-op if it exists; the parent always does
+        if (d != ExeDirectory()) CopyInSettings(ExeDirectory(), d);
         return d;
     }();
     return dir;

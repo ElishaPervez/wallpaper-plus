@@ -22,11 +22,17 @@ VIDEOS
 WHERE SETTINGS GO
   Next to the programs, in this folder. If Windows won't let the programs write here (for
   example Windows Security's "Controlled folder access", or Program Files), they go to
-  %LOCALAPPDATA%\WallpaperPlus instead (paste that into File Explorer's address bar).
+  %LOCALAPPDATA%\WallpaperPlus instead (paste that into File Explorer's address bar), and the
+  settings and library you already had here come along.
 
 TROUBLE
   - Nothing plays: open wallpaper-plus.log (in one of the two places above); it says why.
   - Settings window won't open: install "Microsoft Edge WebView2 Runtime" from Microsoft
     (already built into Windows 11).
-  - To remove it: right-click the tray icon > Quit, turn off "Start with Windows" first if you
-    want, then delete this folder.
+  - To remove it:
+      1. In the settings window, turn off "Start with Windows" (Settings > General).
+      2. Right-click the tray icon > Quit.
+      3. Delete this folder.
+      4. Also delete the folder %LOCALAPPDATA%\WallpaperPlus (paste that into File Explorer's
+         address bar). The settings window always keeps some files there, and your settings
+         may be there too.
