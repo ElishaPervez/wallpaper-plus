@@ -158,6 +158,7 @@ static json ToJson(const Config& c) {
             {"pauseAllWhenFullscreen", c.pauseAllWhenFullscreen},
             {"pauseFor", pauseFor},
             {"fpsCap", c.fpsCap},
+            {"decoder", DecoderName(c.decoder)},
             {"autostart", c.autostart},
             {"paused", c.paused},
             {"defaults", ToJson(c.defaults)},
@@ -170,6 +171,7 @@ static Config ConfigFromJson(const json& j) {
     c.pauseAllWhenFullscreen = j.value("pauseAllWhenFullscreen", false);
     for (auto& e : j.value("pauseFor", json::array())) c.pauseFor.push_back(Lower(Wide(e.get<std::string>())));
     c.fpsCap = std::clamp(j.value("fpsCap", 0), 0, 240);
+    c.decoder = DecoderFromName(Wide(j.value("decoder", "auto")));
     c.autostart = j.value("autostart", true);
     c.paused = j.value("paused", false);
     if (j.contains("defaults")) c.defaults = MonitorFromJson(j["defaults"]);
@@ -558,6 +560,29 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
         return true;
     }
     if (cmd == "playerRunning") return FindWindowW(kControllerClass, nullptr) != nullptr;
+    if (cmd == "decoderStatus") {  // what the player says each monitor is decoding with
+        json out = json::array();
+        if (!FindWindowW(kControllerClass, nullptr)) return out;  // a stale file from a crash means nothing
+        std::ifstream f(exeDir_ + L"\\player-status.txt", std::ios::binary);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::vector<std::string> parts;
+            for (size_t start = 0;;) {
+                size_t tab = line.find('\t', start);
+                parts.push_back(line.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+                if (tab == std::string::npos) break;
+                start = tab + 1;
+            }
+            if (parts.size() < 5) continue;
+            out.push_back({{"monitor", atoi(parts[0].c_str())},
+                           {"device", parts[1]},
+                           {"hardware", parts[2] == "hardware"},
+                           {"codec", parts[3]},
+                           {"size", parts[4]}});
+        }
+        return out;
+    }
     if (cmd == "startPlayer") {
         std::wstring exe = exeDir_ + L"\\WallpaperPlus.exe";
         return (INT_PTR)ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, exeDir_.c_str(), SW_SHOWNORMAL) > 32;

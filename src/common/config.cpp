@@ -104,6 +104,17 @@ static void ApplySection(const Section& s, MonitorSetting& m) {
     if (auto it = s.find(L"shuffle"); it != s.end()) m.shuffle = ParseBool(it->second, false);
 }
 
+const char* DecoderName(DecoderPreference d) {
+    return d == DecoderPreference::PowerSaving ? "power_saving" : d == DecoderPreference::Cpu ? "cpu" : "auto";
+}
+
+DecoderPreference DecoderFromName(const std::wstring& name) {
+    std::wstring l = Lower(name);
+    if (l == L"power_saving" || l == L"integrated") return DecoderPreference::PowerSaving;
+    if (l == L"cpu" || l == L"processor" || l == L"software") return DecoderPreference::Cpu;
+    return DecoderPreference::Auto;
+}
+
 MonitorSetting Config::ForMonitor(int number) const {
     auto it = perMonitor.find(number);
     return it != perMonitor.end() ? it->second : defaults;
@@ -141,6 +152,7 @@ Config LoadConfig(const std::wstring& path) {
     if (auto v = get(L"pause_for"))
         for (auto& exe : Split(*v, L',')) cfg.pauseFor.push_back(Lower(exe));
     if (auto v = get(L"fps_cap")) cfg.fpsCap = std::clamp(_wtoi(v->c_str()), 0, 240);
+    if (auto v = get(L"decoder")) cfg.decoder = DecoderFromName(*v);
     if (auto v = get(L"autostart")) cfg.autostart = ParseBool(*v, true);
     if (auto v = get(L"paused")) cfg.paused = ParseBool(*v, false);
 
@@ -177,12 +189,15 @@ bool SaveConfig(const std::wstring& path, const Config& cfg) {
     o << "; Wallpaper Plus settings. The settings window writes this file; hand edits apply on save.\r\n"
       << "; video: full path to a video. Several paths separated by | make a playlist.\r\n"
       << "; fit: fill (crop to fill) | fit (black bars) | stretch.  brightness: 10-100.  speed: 0.25-2.\r\n"
-      << "; Monitors are numbered left to right, starting at 1.\r\n\r\n"
+      << "; Monitors are numbered left to right, starting at 1.\r\n"
+      << "; decoder: auto (NVIDIA first, then other GPUs, then the processor) | power_saving (integrated GPU\r\n"
+      << ";   first) | cpu (processor only). Videos a GPU can't decode always fall back to the processor.\r\n\r\n"
       << "[general]\r\n"
       << "pause_when_covered = " << (cfg.pauseWhenCovered ? "true" : "false") << "\r\n"
       << "pause_all_when_fullscreen = " << (cfg.pauseAllWhenFullscreen ? "true" : "false") << "\r\n"
       << "pause_for = \"" << WideToUtf8(pauseFor) << "\"\r\n"
       << "fps_cap = " << cfg.fpsCap << "\r\n"
+      << "decoder = " << DecoderName(cfg.decoder) << "\r\n"
       << "autostart = " << (cfg.autostart ? "true" : "false") << "\r\n"
       << "paused = " << (cfg.paused ? "true" : "false") << "\r\n\r\n"
       << "[default]\r\n";

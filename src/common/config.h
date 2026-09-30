@@ -5,6 +5,13 @@
 
 enum class FitMode { Fill, Fit, Stretch };
 
+// Which chip decodes the videos. Whatever is chosen, a video the chosen chip can't handle falls
+// through to the next one, ending with the processor, so something always plays.
+//  Auto: NVIDIA's decoder first, then other GPUs (fastest first), then the processor.
+//  PowerSaving: integrated GPU first (keeps a laptop's discrete GPU asleep), then others, then the processor.
+//  Cpu: always decode on the processor; the GPU only draws.
+enum class DecoderPreference { Auto, PowerSaving, Cpu };
+
 // What one monitor plays. One video = a single wallpaper; several = a playlist.
 struct MonitorSetting {
     std::vector<std::wstring> videos;
@@ -21,6 +28,7 @@ struct Config {
     bool pauseAllWhenFullscreen = false;  // freeze every monitor while a fullscreen app has focus
     std::vector<std::wstring> pauseFor;   // freeze every monitor while any of these exes run (lowercase)
     int fpsCap = 0;                       // max frames shown per second (0 = video's own rate)
+    DecoderPreference decoder = DecoderPreference::Auto;
     bool autostart = true;
     bool paused = false;                  // manual "pause all" from the tray or settings window
     MonitorSetting defaults;
@@ -31,6 +39,9 @@ struct Config {
 
 // Reads the ini file. If it doesn't exist, writes a commented template first.
 Config LoadConfig(const std::wstring& path);
+
+const char* DecoderName(DecoderPreference d);  // "auto" | "power_saving" | "cpu"
+DecoderPreference DecoderFromName(const std::wstring& name);
 
 // Writes the whole file (atomically, so a reader never sees half a file).
 bool SaveConfig(const std::wstring& path, const Config& cfg);

@@ -63,6 +63,7 @@ const state = {
   selected: 1,
   view: 'monitors',
   playerRunning: true,
+  decoderStatus: [], // per monitor: which chip is decoding (from the player)
   pick: null,       // { monitor, mode: 'replace' | 'add' } while choosing from the library
   search: '',
   sort: 'added',
@@ -319,6 +320,7 @@ function setView(view) {
   if (view !== 'library') state.pick = null;
   state.view = view;
   render();
+  if (view === 'settings') refreshDecoderStatus();
 }
 
 // ---------- rendering: monitors ----------
@@ -972,6 +974,30 @@ document.addEventListener('visibilitychange', () => {
 
 // ---------- rendering: settings ----------
 
+const decoders = [['auto', 'Automatic'], ['power_saving', 'Power saving'], ['cpu', 'Processor']];
+const decoderHelp = {
+  auto: 'Uses the NVIDIA decoder if there is one, then any other GPU, then the processor.',
+  power_saving: 'Uses the integrated GPU first, so a laptop\'s NVIDIA or AMD chip can stay asleep.',
+  cpu: 'Decodes on the processor and only draws on the GPU. Uses much more processor time; for troubleshooting.',
+};
+
+function decoderStatusHtml() {
+  if (!state.playerRunning || !state.decoderStatus.length) return '';
+  const lines = state.decoderStatus.map((d) => {
+    const how = d.hardware ? `${esc(d.device)} hardware decoder` : `Processor (drawn by ${esc(d.device)})`;
+    return `<div class="decoder-line"><span class="decoder-line__dot${d.hardware ? '' : ' decoder-line__dot--cpu'}"></span>Monitor ${d.monitor}: ${how} · ${esc(d.codec)} ${esc(d.size)}</div>`;
+  });
+  return `<div class="decoder-status">${lines.join('')}</div>`;
+}
+
+async function refreshDecoderStatus() {
+  const list = await rpc('decoderStatus').catch(() => null);
+  if (!list || JSON.stringify(list) === JSON.stringify(state.decoderStatus)) return;
+  state.decoderStatus = list;
+  const box = $('#decoder-status');
+  if (box) box.innerHTML = decoderStatusHtml();
+}
+
 function renderSettings() {
   const c = state.config;
   const caps = [[0, 'Off'], [15, '15'], [24, '24'], [30, '30'], [60, '60']];
@@ -993,6 +1019,16 @@ function renderSettings() {
           </div>
           <div class="segmented" role="group" aria-label="Frame-rate cap">
             ${caps.map(([v, label]) => `<button data-action="fps" data-value="${v}" aria-pressed="${c.fpsCap === v}">${label}</button>`).join('')}
+          </div>
+        </div>
+        <div class="row" style="align-items:flex-start">
+          <div class="row__text">
+            <div class="row__title">Video decoding</div>
+            <div class="row__desc">${decoderHelp[c.decoder] || decoderHelp.auto} If the chosen chip can't play a video, the next one takes over, down to the processor, so wallpapers keep playing.</div>
+            <div id="decoder-status">${decoderStatusHtml()}</div>
+          </div>
+          <div class="segmented" role="group" aria-label="Video decoding">
+            ${decoders.map(([v, label]) => `<button data-action="decoder" data-value="${v}" aria-pressed="${c.decoder === v}">${label}</button>`).join('')}
           </div>
         </div>
       </section>
@@ -1145,6 +1181,7 @@ function addPauseApp(exe) {
 }
 
 async function pollPlayer() {
+  if (state.view === 'settings') refreshDecoderStatus();
   const running = await rpc('playerRunning').catch(() => state.playerRunning);
   if (running !== state.playerRunning) {
     state.playerRunning = running;
@@ -1253,6 +1290,11 @@ document.addEventListener('click', async (e) => {
       case 'fps':
         state.config.fpsCap = Number(el.dataset.value);
         saveConfig(); renderSettings();
+        break;
+      case 'decoder':
+        state.config.decoder = el.dataset.value;
+        saveConfig(); renderSettings();
+        setTimeout(refreshDecoderStatus, 1500);  // the player restarts its monitors with the new choice
         break;
       case 'toggle':
         state.config[el.dataset.key] = !state.config[el.dataset.key];

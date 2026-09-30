@@ -16,9 +16,12 @@ set LFLAGS=/LTCG /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
 rc /nologo /fo build\obj\app.res res\app.rc || exit /b 1
 
 echo === player ===
-cl %CFLAGS% src\player\*.cpp src\common\*.cpp /Fobuild\obj\player\ /Fe:build\WallpaperPlus.exe build\obj\app.res ^
+rem Shaders that draw processor-decoded frames, compiled to byte arrays the player embeds.
+fxc /nologo /T vs_4_0 /E VSMain /Vn g_vs /Fh build\obj\player\shader_vs.h src\player\shaders.hlsl >nul || exit /b 1
+fxc /nologo /T ps_4_0 /E PSMain /Vn g_ps /Fh build\obj\player\shader_ps.h src\player\shaders.hlsl >nul || exit /b 1
+cl %CFLAGS% /Ibuild\obj\player src\player\*.cpp src\common\*.cpp /Fobuild\obj\player\ /Fe:build\WallpaperPlus.exe build\obj\app.res ^
    /link %LFLAGS% ^
-   d3d11.lib dxgi.lib mfplat.lib mfreadwrite.lib mfuuid.lib propsys.lib dwmapi.lib wtsapi32.lib ^
+   d3d11.lib dxgi.lib dxguid.lib mfplat.lib mfreadwrite.lib mfuuid.lib propsys.lib dwmapi.lib wtsapi32.lib ^
    user32.lib shell32.lib gdi32.lib ole32.lib advapi32.lib || exit /b 1
 
 if not exist src\settings\main.cpp goto :done

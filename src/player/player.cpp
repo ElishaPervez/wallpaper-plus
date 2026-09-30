@@ -1,9 +1,11 @@
 #include "player.h"
 #include "log.h"
 
+#include <codecapi.h>
 #include <mfidl.h>
 #include <propvarutil.h>
 #include <algorithm>
+#include <cstring>
 
 // Monotonic clock in 100 ns units (Media Foundation's time unit).
 static LONGLONG Now100ns() {
@@ -17,9 +19,9 @@ static LONGLONG Now100ns() {
     return (c.QuadPart / freq) * 10'000'000 + (c.QuadPart % freq) * 10'000'000 / freq;
 }
 
-Player::Player(const Gpu& gpu, HWND surface, int width, int height, PlaybackSettings settings, HWND controller,
-               int number)
-    : gpu_(gpu), surface_(surface), width_(width), height_(height), controller_(controller), number_(number) {
+Player::Player(GpuSet& gpus, HMONITOR monitor, HWND surface, int width, int height, PlaybackSettings settings,
+               HWND controller, int number)
+    : gpus_(gpus), monitor_(monitor), surface_(surface), width_(width), height_(height), controller_(controller), number_(number) {
     pending_ = std::move(settings);
     wake_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -50,6 +52,66 @@ void Player::SetPaused(bool paused) {
     }
 }
 
+std::wstring Player::Status() {
+    std::lock_guard lock(pendingMutex_);
+    return status_;
+}
+
+static const wchar_t* CodecName(const GUID& codec) {
+    if (codec == MFVideoFormat_H264) return L"H.264";
+    if (codec == MFVideoFormat_HEVC) return L"HEVC";
+    if (codec == MFVideoFormat_VP90) return L"VP9";
+    if (codec == MFVideoFormat_AV1) return L"AV1";
+    if (codec == MFVideoFormat_MPEG2) return L"MPEG-2";
+    if (codec == MFVideoFormat_WVC1) return L"VC-1";
+    return L"other";
+}
+
+void Player::SetStatus(bool hardwareFrames) {
+    wchar_t text[256];
+    swprintf_s(text, L"%s\t%s\t%s%s\t%ux%u", gpu_->name.c_str(), hardwareFrames ? L"hardware" : L"processor",
+               CodecName(info_.codec), fmt_.subtype == MFVideoFormat_P010 ? L" 10-bit" : L"",
+               fmt_.aperture.right - fmt_.aperture.left, fmt_.aperture.bottom - fmt_.aperture.top);
+    {
+        std::lock_guard lock(pendingMutex_);
+        if (status_ == text) return;
+        status_ = text;
+    }
+    PostMessageW(controller_, WM_APP_STATUS, 0, 0);
+}
+
+void Player::ClearStatus() {
+    {
+        std::lock_guard lock(pendingMutex_);
+        if (status_.empty()) return;
+        status_.clear();
+    }
+    PostMessageW(controller_, WM_APP_STATUS, 0, 0);
+}
+
+bool Player::UseGpu(Gpu* gpu) {
+    if (gpu == gpu_ && swap_) return true;
+    reader_.Reset();
+    ReleaseOutput();
+    if (swap_) {
+        swap_.Reset();
+        gpu_->context->Flush();  // the old swap chain must be gone before the window gets a new one
+    }
+    gpu_ = gpu;
+    return CreateSwapChain();
+}
+
+void Player::ReleaseOutput() {
+    inViews_.clear();
+    outView_.Reset();
+    vp_.Reset();
+    vpEnum_.Reset();
+    for (auto& p : planes_) p.Reset();
+    for (auto& v : planeViews_) v.Reset();
+    target_.Reset();
+    constants_.Reset();
+}
+
 bool Player::CreateSwapChain() {
     DXGI_SWAP_CHAIN_DESC1 d{};
     d.Width = width_;
@@ -61,22 +123,98 @@ bool Player::CreateSwapChain() {
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     d.Scaling = DXGI_SCALING_STRETCH;
     d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    HRESULT hr = gpu_.factory->CreateSwapChainForHwnd(gpu_.device.Get(), surface_, &d, nullptr, nullptr, &swap_);
+    HRESULT hr = gpu_->factory->CreateSwapChainForHwnd(gpu_->device.Get(), surface_, &d, nullptr, nullptr, &swap_);
     if (FAILED(hr)) {
-        Log(L"Monitor %d: CreateSwapChainForHwnd failed 0x%08X", number_, hr);
+        Log(L"Monitor %d: can't draw with %s (swap chain 0x%08X)", number_, gpu_->name.c_str(), hr);
         return false;
     }
-    gpu_.factory->MakeWindowAssociation(surface_, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+    gpu_->factory->MakeWindowAssociation(surface_, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+    return true;
+}
+
+// Reads codec, size and bit depth from the file, to pick a decoder before creating one.
+static bool ProbeVideo(const std::wstring& path, VideoInfo& info, HRESULT& hr) {
+    ComPtr<IMFSourceReader> reader;
+    if (FAILED(hr = MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader))) return false;
+    ComPtr<IMFMediaType> type;
+    if (FAILED(hr = reader->GetNativeMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &type))) return false;
+    info = {};
+    type->GetGUID(MF_MT_SUBTYPE, &info.codec);
+    MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &info.width, &info.height);
+    const UINT32 profile = MFGetAttributeUINT32(type.Get(), MF_MT_VIDEO_PROFILE, 0);
+    const UINT32 transfer = MFGetAttributeUINT32(type.Get(), MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_Unknown);
+    info.tenBit = transfer == MFVideoTransFunc_2084 || transfer == MFVideoTransFunc_HLG ||
+                  (info.codec == MFVideoFormat_H264 && profile == eAVEncH264VProfile_High10) ||
+                  (info.codec == MFVideoFormat_HEVC && profile == eAVEncH265VProfile_Main_420_10) ||
+                  (info.codec == MFVideoFormat_VP90 && profile == eAVEncVP9VProfile_420_10);
     return true;
 }
 
 bool Player::OpenVideo(const std::wstring& path) {
     reader_.Reset();
+    HRESULT hr = S_OK;
+    if (!ProbeVideo(path, info_, hr)) {
+        Log(L"Monitor %d: can't open %s (0x%08X)", number_, path.c_str(), hr);
+        return false;
+    }
+    decoderCursor_ = 0;
+    triedProcessor_ = false;
+    if (OpenNextDecoder(path)) return true;
+    Log(L"Monitor %d: nothing on this PC can decode %s (%s). HEVC/AV1 need the Microsoft Store codec extensions.",
+        number_, path.c_str(), CodecName(info_.codec));
+    return false;
+}
+
+// Tries the remaining decoders for the current video in order: each GPU that says it handles the
+// codec, then the processor.
+bool Player::OpenNextDecoder(const std::wstring& path) {
+    for (;;) {
+        Gpu* gpu = gpus_.NextDecoder(info_, decoderCursor_);
+        const bool hardware = gpu != nullptr;
+        if (!gpu) {
+            if (triedProcessor_) return false;
+            triedProcessor_ = true;
+            gpu = gpus_.RendererFor(monitor_);
+            if (!gpu) return false;
+        }
+        if (UseGpu(gpu) && OpenReader(path, hardware) && ReadFormat() && ConfigureOutput()) {
+            shownKind_ = hardware ? 1 : 2;  // what's expected; the first frame corrects it if needed
+            SetStatus(hardware);
+            Log(L"Monitor %d: playing %s  %s %ux%u @ %.2f fps, %s, %s %s", number_, path.c_str(),
+                CodecName(info_.codec), fmt_.width, fmt_.height, (double)fmt_.fpsN / fmt_.fpsD,
+                fmt_.subtype == MFVideoFormat_P010 ? L"10-bit" : L"8-bit",
+                hardware ? L"hardware decoder of" : L"processor decoding, drawn by", gpu->name.c_str());
+            return true;
+        }
+        reader_.Reset();
+        if (hardware) Log(L"Monitor %d: %s's decoder won't take this video; trying the next option", number_, gpu->name.c_str());
+    }
+}
+
+bool Player::FallBack() {
+    if (cur_.monitor.videos.empty()) return false;
+    const std::wstring& path = cur_.monitor.videos[index_];
+    Log(L"Monitor %d: %s stopped decoding %s; switching decoder", number_,
+        hardware_ ? gpu_->name.c_str() : L"the processor", path.c_str());
+    reader_.Reset();
+    if (!OpenNextDecoder(path)) return false;
+    ResetClock();
+    return true;
+}
+
+bool Player::OpenReader(const std::wstring& path, bool hardware) {
+    reader_.Reset();
+    hardware_ = hardware;
     ComPtr<IMFAttributes> attrs;
     MFCreateAttributes(&attrs, 3);
-    attrs->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, gpu_.dxgiManager.Get());
-    attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-    attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA, FALSE);
+    if (hardware) {
+        attrs->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, gpu_->dxgiManager.Get());
+        attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+        attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA, FALSE);
+    } else {
+        // Software decoder; lets Media Foundation convert odd decoder outputs (e.g. I420) to NV12.
+        attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    }
 
     HRESULT hr = MFCreateSourceReaderFromURL(path.c_str(), attrs.Get(), &reader_);
     if (FAILED(hr)) {
@@ -97,8 +235,7 @@ bool Player::OpenVideo(const std::wstring& path) {
     hr = trySubtype(MFVideoFormat_NV12);
     if (FAILED(hr)) hr = trySubtype(MFVideoFormat_P010);
     if (FAILED(hr)) {
-        Log(L"Monitor %d: no decoder for %s (0x%08X). HEVC/AV1 need the Microsoft Store codec extensions.", number_,
-            path.c_str(), hr);
+        Log(L"Monitor %d: no %s decoder for %s (0x%08X)", number_, hardware ? L"hardware" : L"software", path.c_str(), hr);
         reader_.Reset();
         return false;
     }
@@ -128,10 +265,6 @@ bool Player::OpenVideo(const std::wstring& path) {
         }
     }
 
-    if (!ReadFormat()) {
-        reader_.Reset();
-        return false;
-    }
     PROPVARIANT dur;
     PropVariantInit(&dur);
     duration_ = 0;
@@ -139,8 +272,6 @@ bool Player::OpenVideo(const std::wstring& path) {
         dur.vt == VT_UI8)
         duration_ = (LONGLONG)dur.uhVal.QuadPart;
     PropVariantClear(&dur);
-    Log(L"Monitor %d: playing %s  %ux%u @ %.2f fps, %s", number_, path.c_str(), fmt_.width, fmt_.height,
-        (double)fmt_.fpsN / fmt_.fpsD, fmt_.subtype == MFVideoFormat_P010 ? L"10-bit" : L"8-bit");
     return true;
 }
 
@@ -168,6 +299,9 @@ bool Player::ReadFormat() {
     f.range = MFGetAttributeUINT32(type.Get(), MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_Unknown);
     f.transfer = MFGetAttributeUINT32(type.Get(), MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_Unknown);
     if (!f.width || !f.height) return false;
+    const UINT32 bytesPerSample = f.subtype == MFVideoFormat_P010 ? 2 : 1;
+    f.stride = (LONG)MFGetAttributeUINT32(type.Get(), MF_MT_DEFAULT_STRIDE, f.width * bytesPerSample);
+    if (f.stride < (LONG)(f.width * bytesPerSample)) f.stride = f.width * bytesPerSample;
 
     fmt_ = f;
     frameDuration_ = 10'000'000LL * f.fpsD / f.fpsN;
@@ -211,12 +345,103 @@ static DXGI_COLOR_SPACE_TYPE InputColorSpace(UINT32 matrix, UINT32 range, UINT32
     return full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709 : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
 }
 
-bool Player::ConfigureProcessor() {
-    vp_.Reset();
-    vpEnum_.Reset();
-    outView_.Reset();
-    inViews_.clear();
+bool Player::ConfigureOutput() {
+    ReleaseOutput();
+    // A hardware decoder hands over GPU textures for the video processor. Processor-decoded frames
+    // (and, rarely, a "hardware" reader that Windows quietly gave a software decoder) go through
+    // the shader, so that's always set up.
+    if (hardware_ && !ConfigureProcessor()) return false;
+    return ConfigureShader();
+}
 
+// YUV -> RGB rows for the shader, including range expansion and dimming. Samples arrive as UNORM
+// floats: 8-bit as code/255, P010 (10 bits in the top of 16) as code*64/65535.
+static void ColorMatrix(UINT32 matrix, UINT32 range, UINT32 height, bool tenBit, float brightness, float out[12]) {
+    double kr = 0.2126, kb = 0.0722;  // BT.709
+    if (matrix == MFVideoTransferMatrix_BT2020_10 || matrix == MFVideoTransferMatrix_BT2020_12) {
+        kr = 0.2627;
+        kb = 0.0593;
+    } else if (matrix == MFVideoTransferMatrix_BT601 || (matrix == MFVideoTransferMatrix_Unknown && height < 720)) {
+        kr = 0.299;
+        kb = 0.114;
+    }
+    const double kg = 1 - kr - kb;
+    const int bits = tenBit ? 10 : 8;
+    const double toCode = tenBit ? 65535.0 / 64 : 255.0, maxCode = (1 << bits) - 1, shift = 1 << (bits - 8);
+    const bool full = range == MFNominalRange_0_255;
+    const double yOff = full ? 0 : 16 * shift, yRange = full ? maxCode : 219 * shift;
+    const double cOff = 128 * shift, cRange = full ? maxCode : 224 * shift;
+    // Y' = ay*y + by; Cb = ac*u + bc; Cr = ac*v + bc
+    const double ay = toCode / yRange, by = -yOff / yRange, ac = toCode / cRange, bc = -cOff / cRange;
+    const double rv = 2 * (1 - kr), gu = -2 * kb * (1 - kb) / kg, gv = -2 * kr * (1 - kr) / kg, bu = 2 * (1 - kb);
+    const double rows[3][4] = {{ay, 0, rv * ac, by + rv * bc},
+                               {ay, gu * ac, gv * ac, by + (gu + gv) * bc},
+                               {ay, bu * ac, 0, by + bu * bc}};
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c) out[r * 4 + c] = (float)(rows[r][c] * brightness);
+}
+
+bool Player::ConfigureShader() {
+    ComPtr<ID3D11Texture2D> backBuffer;
+    HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (SUCCEEDED(hr)) hr = gpu_->device->CreateRenderTargetView(backBuffer.Get(), nullptr, &target_);
+    if (FAILED(hr)) {
+        Log(L"Monitor %d: render target creation failed 0x%08X", number_, hr);
+        return false;
+    }
+
+    RECT src, dst;
+    ComputeRects(src, dst);
+    viewport_ = {(float)dst.left, (float)dst.top, (float)(dst.right - dst.left), (float)(dst.bottom - dst.top), 0, 1};
+    struct {
+        float uvRect[4];
+        float matrix[12];
+    } constants{};
+    constants.uvRect[0] = (float)src.left / fmt_.width;
+    constants.uvRect[1] = (float)src.top / fmt_.height;
+    constants.uvRect[2] = (float)src.right / fmt_.width;
+    constants.uvRect[3] = (float)src.bottom / fmt_.height;
+    ColorMatrix(fmt_.matrix, fmt_.range, fmt_.height, fmt_.subtype == MFVideoFormat_P010, cur_.monitor.brightness / 100.f,
+                constants.matrix);
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(constants);
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA init{&constants};
+    if (FAILED(hr = gpu_->device->CreateBuffer(&bd, &init, &constants_))) {
+        Log(L"Monitor %d: constant buffer creation failed 0x%08X", number_, hr);
+        return false;
+    }
+    return true;  // plane textures are made when the first frame in memory arrives
+}
+
+bool Player::EnsurePlanes() {
+    if (planes_[0]) return true;
+    const bool tenBit = fmt_.subtype == MFVideoFormat_P010;
+    const DXGI_FORMAT formats[2] = {tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
+                                    tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM};
+    for (int i = 0; i < 2; ++i) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = i ? (fmt_.width + 1) / 2 : fmt_.width;
+        td.Height = i ? (fmt_.height + 1) / 2 : fmt_.height;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = formats[i];
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        HRESULT hr = gpu_->device->CreateTexture2D(&td, nullptr, &planes_[i]);
+        if (SUCCEEDED(hr)) hr = gpu_->device->CreateShaderResourceView(planes_[i].Get(), nullptr, &planeViews_[i]);
+        if (FAILED(hr)) {
+            Log(L"Monitor %d: frame texture creation failed 0x%08X", number_, hr);
+            planes_[0].Reset();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Player::ConfigureProcessor() {
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
     cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     cd.InputFrameRate = {fmt_.fpsN, fmt_.fpsD};
@@ -227,8 +452,8 @@ bool Player::ConfigureProcessor() {
     cd.OutputHeight = height_;
     cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
-    HRESULT hr = gpu_.videoDevice->CreateVideoProcessorEnumerator(&cd, &vpEnum_);
-    if (SUCCEEDED(hr)) hr = gpu_.videoDevice->CreateVideoProcessor(vpEnum_.Get(), 0, &vp_);
+    HRESULT hr = gpu_->videoDevice->CreateVideoProcessorEnumerator(&cd, &vpEnum_);
+    if (SUCCEEDED(hr)) hr = gpu_->videoDevice->CreateVideoProcessor(vpEnum_.Get(), 0, &vp_);
     if (FAILED(hr)) {
         Log(L"Monitor %d: video processor creation failed 0x%08X", number_, hr);
         return false;
@@ -238,13 +463,13 @@ bool Player::ConfigureProcessor() {
     swap_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd{};
     ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    hr = gpu_.videoDevice->CreateVideoProcessorOutputView(backBuffer.Get(), vpEnum_.Get(), &ovd, &outView_);
+    hr = gpu_->videoDevice->CreateVideoProcessorOutputView(backBuffer.Get(), vpEnum_.Get(), &ovd, &outView_);
     if (FAILED(hr)) {
         Log(L"Monitor %d: output view creation failed 0x%08X", number_, hr);
         return false;
     }
 
-    auto* ctx = gpu_.videoContext.Get();
+    auto* ctx = gpu_->videoContext.Get();
     RECT src, dst, full = {0, 0, width_, height_};
     ComputeRects(src, dst);
     ctx->VideoProcessorSetStreamFrameFormat(vp_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
@@ -274,7 +499,7 @@ bool Player::ConfigureProcessor() {
     ComPtr<ID3D11VideoContext1> ctx1;
     ComPtr<ID3D11VideoProcessorEnumerator1> enum1;
     BOOL supported = FALSE;
-    if (SUCCEEDED(gpu_.videoContext.As(&ctx1)) && SUCCEEDED(vpEnum_.As(&enum1)) &&
+    if (SUCCEEDED(gpu_->videoContext.As(&ctx1)) && SUCCEEDED(vpEnum_.As(&enum1)) &&
         SUCCEEDED(enum1->CheckVideoProcessorFormatConversion(inFormat, inCs, DXGI_FORMAT_B8G8R8A8_UNORM, outCs,
                                                              &supported)) &&
         supported) {
@@ -302,46 +527,129 @@ ID3D11VideoProcessorInputView* Player::InputViewFor(ID3D11Texture2D* tex, UINT s
     ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
     ivd.Texture2D.ArraySlice = slice;
     ComPtr<ID3D11VideoProcessorInputView> view;
-    HRESULT hr = gpu_.videoDevice->CreateVideoProcessorInputView(tex, vpEnum_.Get(), &ivd, &view);
+    HRESULT hr = gpu_->videoDevice->CreateVideoProcessorInputView(tex, vpEnum_.Get(), &ivd, &view);
     if (FAILED(hr)) {
-        if (!bltErrorLogged_) Log(L"Monitor %d: input view creation failed 0x%08X", number_, hr);
-        bltErrorLogged_ = true;
+        Log(L"Monitor %d: input view creation failed 0x%08X", number_, hr);
         return nullptr;
     }
     inViews_.push_back({tex, slice, view});
     return view.Get();
 }
 
-bool Player::Present(IMFSample* sample) {
-    ComPtr<IMFMediaBuffer> buffer;
-    ComPtr<IMFDXGIBuffer> dxgiBuffer;
+bool Player::BlitGpuFrame(IMFDXGIBuffer* dxgiBuffer) {
     ComPtr<ID3D11Texture2D> tex;
     UINT slice = 0;
-    if (FAILED(sample->GetBufferByIndex(0, &buffer)) || FAILED(buffer.As(&dxgiBuffer)) ||
-        FAILED(dxgiBuffer->GetResource(IID_PPV_ARGS(&tex))) || FAILED(dxgiBuffer->GetSubresourceIndex(&slice))) {
-        if (!bltErrorLogged_) Log(L"Monitor %d: decoded frame is not on the GPU", number_);
-        bltErrorLogged_ = true;
-        return true;
-    }
-
+    if (!vp_ || FAILED(dxgiBuffer->GetResource(IID_PPV_ARGS(&tex))) || FAILED(dxgiBuffer->GetSubresourceIndex(&slice)))
+        return false;
     ID3D11VideoProcessorInputView* in = InputViewFor(tex.Get(), slice);
-    if (!in) return true;
+    if (!in) return false;
 
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
     stream.pInputSurface = in;
-    HRESULT hr = gpu_.videoContext->VideoProcessorBlt(vp_.Get(), outView_.Get(), 0, 1, &stream);
-    if (FAILED(hr) && !bltErrorLogged_) {
+    HRESULT hr = gpu_->videoContext->VideoProcessorBlt(vp_.Get(), outView_.Get(), 0, 1, &stream);
+    if (FAILED(hr)) {
         Log(L"Monitor %d: VideoProcessorBlt failed 0x%08X", number_, hr);
-        bltErrorLogged_ = true;
-    }
-
-    hr = swap_->Present(1, 0);
-    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-        Log(L"Monitor %d: GPU device lost (0x%08X)", number_, gpu_.device->GetDeviceRemovedReason());
         return false;
     }
     return true;
+}
+
+// Copies one plane from a decoded frame in memory into its texture.
+static bool UploadPlane(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, const BYTE* src, LONG pitch, UINT rowBytes,
+                        UINT rows) {
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ctx->Map(tex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return false;
+    auto* dst = static_cast<BYTE*>(m.pData);
+    for (UINT y = 0; y < rows; ++y) memcpy(dst + (size_t)y * m.RowPitch, src + (ptrdiff_t)y * pitch, rowBytes);
+    ctx->Unmap(tex, 0);
+    return true;
+}
+
+bool Player::DrawMemoryFrame(IMFSample* sample) {
+    if (!EnsurePlanes()) return false;
+    ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(sample->ConvertToContiguousBuffer(&buffer))) return false;
+
+    const UINT bytesPerSample = fmt_.subtype == MFVideoFormat_P010 ? 2 : 1;
+    const UINT rows = fmt_.height, chromaRows = (fmt_.height + 1) / 2;
+    const UINT rowBytes = fmt_.width * bytesPerSample, chromaRowBytes = (fmt_.width + 1) / 2 * 2 * bytesPerSample;
+
+    BYTE* scan0 = nullptr;
+    BYTE* start = nullptr;
+    LONG pitch = 0;
+    DWORD length = 0;
+    ComPtr<IMF2DBuffer2> buffer2d;
+    bool locked2d = SUCCEEDED(buffer.As(&buffer2d)) &&
+                    SUCCEEDED(buffer2d->Lock2DSize(MF2DBuffer_LockFlags_Read, &scan0, &pitch, &start, &length));
+    if (!locked2d) {
+        if (FAILED(buffer->Lock(&start, nullptr, &length))) return false;
+        scan0 = start;
+        pitch = fmt_.stride;
+    }
+    // The UV plane follows the Y plane at the same pitch. Check it all lies inside the buffer.
+    const bool fits = pitch >= (LONG)rowBytes &&
+                      (size_t)(scan0 - start) + (size_t)pitch * (rows + chromaRows - 1) + chromaRowBytes <= length;
+    bool ok = fits && UploadPlane(gpu_->context.Get(), planes_[0].Get(), scan0, pitch, rowBytes, rows) &&
+              UploadPlane(gpu_->context.Get(), planes_[1].Get(), scan0 + (size_t)pitch * rows, pitch, chromaRowBytes,
+                          chromaRows);
+    if (locked2d)
+        buffer2d->Unlock2D();
+    else
+        buffer->Unlock();
+    if (!ok) {
+        Log(L"Monitor %d: decoded frame has an unexpected layout (pitch %ld, %lu bytes)", number_, pitch, length);
+        return false;
+    }
+
+    // Several players share this device's context: hold its lock so no other thread's calls land
+    // between these state changes and the draw.
+    auto* ctx = gpu_->context.Get();
+    if (gpu_->lock) gpu_->lock->Enter();
+    const float black[4] = {0, 0, 0, 1};
+    ctx->ClearRenderTargetView(target_.Get(), black);
+    ctx->OMSetRenderTargets(1, target_.GetAddressOf(), nullptr);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->RSSetState(gpu_->raster.Get());
+    ctx->RSSetViewports(1, &viewport_);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx->VSSetShader(gpu_->vs.Get(), nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 1, constants_.GetAddressOf());
+    ctx->GSSetShader(nullptr, nullptr, 0);
+    ctx->PSSetShader(gpu_->ps.Get(), nullptr, 0);
+    ctx->PSSetConstantBuffers(0, 1, constants_.GetAddressOf());
+    ID3D11ShaderResourceView* views[2] = {planeViews_[0].Get(), planeViews_[1].Get()};
+    ctx->PSSetShaderResources(0, 2, views);
+    ctx->PSSetSamplers(0, 1, gpu_->sampler.GetAddressOf());
+    ctx->Draw(4, 0);
+    ID3D11ShaderResourceView* none[2] = {};
+    ctx->PSSetShaderResources(0, 2, none);
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    if (gpu_->lock) gpu_->lock->Leave();
+    return true;
+}
+
+Player::Shown Player::Present(IMFSample* sample) {
+    ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(sample->GetBufferByIndex(0, &buffer))) return Shown::Failed;
+    ComPtr<IMFDXGIBuffer> dxgiBuffer;
+    const bool onGpu = SUCCEEDED(buffer.As(&dxgiBuffer));
+    if (!(onGpu ? BlitGpuFrame(dxgiBuffer.Get()) : DrawMemoryFrame(sample))) return Shown::Failed;
+
+    HRESULT hr = swap_->Present(1, 0);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        Log(L"Monitor %d: GPU device lost (0x%08X)", number_, gpu_->device->GetDeviceRemovedReason());
+        return Shown::DeviceLost;
+    }
+    const int kind = onGpu ? 1 : 2;
+    if (kind != shownKind_) {  // Windows gave the "hardware" reader a software decoder after all
+        shownKind_ = kind;
+        Log(L"Monitor %d: frames arrive %s; drawing them that way", number_, onGpu ? L"on the GPU" : L"in memory (processor decoding)");
+        SetStatus(onGpu);
+    }
+    return Shown::Ok;
 }
 
 bool Player::SleepUntil(LONGLONG target) {
@@ -374,7 +682,7 @@ void Player::ResetClock() {
 bool Player::OpenCurrent() {
     const auto& videos = cur_.monitor.videos;
     for (size_t attempt = 0; attempt < videos.size(); ++attempt) {
-        if (OpenVideo(videos[index_]) && ConfigureProcessor()) {
+        if (OpenVideo(videos[index_])) {
             ResetClock();
             if (!visible_) ShowWindowAsync(surface_, SW_SHOWNOACTIVATE);
             visible_ = true;
@@ -383,6 +691,7 @@ bool Player::OpenCurrent() {
         index_ = (index_ + 1) % videos.size();  // skip unplayable entries
     }
     reader_.Reset();
+    ClearStatus();
     if (visible_) ShowWindowAsync(surface_, SW_HIDE);  // nothing playable: show the normal wallpaper
     visible_ = false;
     return false;
@@ -409,6 +718,7 @@ void Player::SkipBroken() {
         return;
     }
     Log(L"Monitor %d: nothing in this wallpaper plays; showing the normal wallpaper", number_);
+    ClearStatus();
     if (visible_) ShowWindowAsync(surface_, SW_HIDE);
     visible_ = false;  // reader_ is empty, so the thread now idles until settings change
 }
@@ -429,6 +739,7 @@ void Player::Apply(const PlaybackSettings& next, bool first) {
         index_ = n > 1 && cur_.monitor.shuffle ? std::uniform_int_distribution<size_t>(0, n - 1)(rng_) : 0;
         if (n == 0) {
             reader_.Reset();
+            ClearStatus();
             if (visible_) ShowWindowAsync(surface_, SW_HIDE);
             visible_ = false;
             Log(L"Monitor %d: no video set", number_);
@@ -436,7 +747,7 @@ void Player::Apply(const PlaybackSettings& next, bool first) {
             OpenCurrent();
         }
     } else if (lookChanged && reader_) {
-        ConfigureProcessor();
+        ConfigureOutput();
     }
     haveClock_ = false;  // speed or frame cap may have changed: re-anchor timing at the next frame
     capNext_ = -1;
@@ -446,11 +757,9 @@ void Player::Run() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     SetThreadDescription(GetCurrentThread(), L"WallpaperPlus player");
 
-    bool ok = CreateSwapChain();
-    if (!ok) ShowWindowAsync(surface_, SW_HIDE);
-    bool first = true;
+    bool first = true;  // the swap chain is created when the first video picks its GPU
 
-    while (ok && !stop_) {
+    while (!stop_) {
         std::optional<PlaybackSettings> next;
         {
             std::lock_guard lock(pendingMutex_);
@@ -473,7 +782,7 @@ void Player::Run() {
         HRESULT hr = reader_->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &sample);
         if (FAILED(hr)) {
             Log(L"Monitor %d: decode error 0x%08X", number_, hr);
-            SkipBroken();
+            if (!FallBack()) SkipBroken();
             continue;
         }
 
@@ -504,8 +813,8 @@ void Player::Run() {
             continue;
         }
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
-            if (!ReadFormat() || !ConfigureProcessor()) {
-                reader_.Reset();
+            if (!ReadFormat() || !ConfigureOutput()) {
+                if (!FallBack()) SkipBroken();
                 continue;
             }
         }
@@ -553,9 +862,14 @@ void Player::Run() {
             continue;
         }
 
-        if (!Present(sample.Get())) {
+        const Shown shown = Present(sample.Get());
+        if (shown == Shown::DeviceLost) {
             PostMessageW(controller_, WM_APP_DEVICE_LOST, 0, 0);
             break;
+        }
+        if (shown == Shown::Failed) {  // this decoder's frames can't be drawn: try the next decoder
+            if (!FallBack()) SkipBroken();
+            continue;
         }
         failStreak_ = 0;
 
@@ -571,10 +885,7 @@ void Player::Run() {
     }
 
     // Release GPU objects on this thread before the swap chain's window can go away.
-    inViews_.clear();
-    outView_.Reset();
-    vp_.Reset();
-    vpEnum_.Reset();
+    ReleaseOutput();
     reader_.Reset();
     swap_.Reset();
 

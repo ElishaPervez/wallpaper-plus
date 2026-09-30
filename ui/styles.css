@@ -350,6 +350,11 @@ body[data-maximized] .resize-edges { display: none; }
 .segmented button:hover { color: var(--text); }
 .segmented button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
 
+.decoder-status { margin-top: 10px; display: grid; gap: 4px; }
+.decoder-line { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.decoder-line__dot { width: 7px; height: 7px; border-radius: 50%; background: #6fd49a; flex: none; }
+.decoder-line__dot--cpu { background: var(--accent); }
+
 .range { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; background: none; --fill: 50%; }
 .range::-webkit-slider-runnable-track {
   height: 4px; border-radius: 4px;

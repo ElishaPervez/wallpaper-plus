@@ -4,7 +4,8 @@
 // than message-only, because message-only windows don't receive the TaskbarCreated and
 // WM_DISPLAYCHANGE broadcasts). It owns the tray icon and one surface window + Player per monitor.
 // The settings window is a separate program (WallpaperPlusSettings.exe) launched from the tray;
-// it talks to the player only by rewriting wallpaper.ini, which the player watches.
+// it talks to the player only by rewriting wallpaper.ini, which the player watches. The player
+// reports back which decoder each monitor uses in player-status.txt.
 
 #include "config.h"
 #include "cover_detector.h"
@@ -139,14 +140,16 @@ private:
     void UpdatePause();
     void TogglePause();
     void ScheduleRebuild(UINT ms) { SetTimer(controller_, kTimerRebuild, ms, nullptr); }
+    void WriteStatus();
 
     HINSTANCE inst_ = nullptr;
     HWND controller_ = nullptr;
     std::wstring configPath_;
+    std::wstring statusPath_;
     FILETIME configStamp_{};
     Config config_;
 
-    Gpu gpu_;
+    GpuSet gpus_;
     DesktopLayer layer_;
     std::vector<MonitorInfo> monitors_;
     std::vector<HWND> surfaces_;
@@ -178,7 +181,8 @@ void App::StartMonitor(size_t i) {
     }
     PlaceInLayer(s, layer_);
     surfaces_[i] = s;
-    players_[i] = std::make_unique<Player>(gpu_, s, w, h, SettingsFor(i), controller_, (int)i + 1);
+    HMONITOR monitor = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+    players_[i] = std::make_unique<Player>(gpus_, monitor, s, w, h, SettingsFor(i), controller_, (int)i + 1);
 }
 
 void App::StopMonitor(size_t i) {
@@ -191,7 +195,8 @@ void App::Build() {
     Teardown();
     KillTimer(controller_, kTimerRebuild);
 
-    if (!gpu_.Create()) {
+    if (!gpus_.Init(config_.decoder)) {
+        Log(L"No graphics device could be created; retrying");
         ScheduleRebuild(5000);
         return;
     }
@@ -213,7 +218,32 @@ void App::Teardown() {
     players_.clear();
     surfaces_.clear();
     covered_.clear();
-    gpu_ = Gpu{};
+    gpus_.Reset();
+    WriteStatus();
+}
+
+// One line per playing monitor: number, then Player::Status() (device, hardware|processor, codec, size).
+void App::WriteStatus() {
+    std::wstring text;
+    for (size_t i = 0; i < players_.size(); ++i) {
+        if (!players_[i]) continue;
+        std::wstring status = players_[i]->Status();
+        if (!status.empty()) text += std::to_wstring(i + 1) + L"\t" + status + L"\r\n";
+    }
+    if (text.empty()) {
+        DeleteFileW(statusPath_.c_str());
+        return;
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string utf8(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), utf8.data(), n, nullptr, nullptr);
+    const std::wstring tmp = statusPath_ + L".tmp";
+    HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    const bool ok = WriteFile(f, utf8.data(), (DWORD)utf8.size(), &written, nullptr) && written == utf8.size();
+    CloseHandle(f);
+    if (ok) MoveFileExW(tmp.c_str(), statusPath_.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
 
 void App::ReloadConfig(bool force) {
@@ -232,6 +262,12 @@ void App::ReloadConfig(bool force) {
     if (force) return;
 
     Log(L"Settings reloaded");
+    if (old.decoder != config_.decoder) {  // players hold on to their GPUs: start over with the new ranking
+        Build();
+        pausedApp_ = AnyProcessRunning(config_.pauseFor);
+        UpdatePause();
+        return;
+    }
     // Players apply changes in place (no window rebuild, so no flash of the static wallpaper).
     for (size_t i = 0; i < players_.size(); ++i)
         if (players_[i]) players_[i]->Update(SettingsFor(i));
@@ -307,6 +343,10 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             ScheduleRebuild(1000);
             return 0;
 
+        case Player::WM_APP_STATUS:
+            WriteStatus();
+            return 0;
+
         case WM_TIMER:
             if (wp != kTimerHealth) KillTimer(controller_, wp);  // the rest are one-shot
             if (wp == kTimerCover) {
@@ -380,6 +420,7 @@ int App::Run(HINSTANCE inst) {
     inst_ = inst;
     const std::wstring dir = ExeDirectory();
     configPath_ = dir + L"\\wallpaper.ini";
+    statusPath_ = dir + L"\\player-status.txt";
     LogInit(dir + L"\\wallpaper-plus.log");
     Log(L"Wallpaper Plus starting");
 
