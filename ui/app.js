@@ -1060,9 +1060,9 @@ function renderSettings() {
       <section class="panel">
         <div class="panel__head"><h2 class="panel__title">General</h2></div>
         <div class="row">
-          <div class="row__text"><div class="row__title">Start with Windows</div>
+          <div class="row__text"><div class="row__title">Auto startup on sign in</div>
             <div class="row__desc">Wallpapers start playing when you sign in.</div></div>
-          ${sw('autostart', c.autostart, 'Start with Windows')}
+          ${sw('autostart', c.autostart, 'Auto startup on sign in')}
         </div>
         <div class="row">
           <div class="row__text"><div class="row__title">Wallpapers ${state.playerRunning ? 'are running' : 'are stopped'}</div>
