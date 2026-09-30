@@ -1,9 +1,8 @@
 Wallpaper Plus — video wallpapers for Windows 10 and 11 (64-bit)
 
 START
-  1. Extract this whole folder somewhere you can write to, e.g. Documents or your Desktop
-     (not Program Files: settings are saved next to the programs).
-  2. Double-click WallpaperPlus.exe. The settings window opens; pick a video and it plays
+  1. Right-click the zip and choose "Extract All...". It won't run from inside the zip.
+  2. Open the extracted folder and double-click WallpaperPlus.exe. The settings window opens; pick a video and it plays
      on your desktop.
   Windows may say "Windows protected your PC" because the program isn't signed.
   Click "More info", then "Run anyway".
@@ -20,8 +19,13 @@ VIDEOS
     play on any PC. Settings > Video decoding shows what each monitor is using. On a laptop,
     "Power saving" keeps the NVIDIA/AMD chip asleep.
 
+WHERE SETTINGS GO
+  Next to the programs, in this folder. If Windows won't let the programs write here (for
+  example Windows Security's "Controlled folder access", or Program Files), they go to
+  %LOCALAPPDATA%\WallpaperPlus instead (paste that into File Explorer's address bar).
+
 TROUBLE
-  - Nothing plays: open wallpaper-plus.log in this folder; it says why.
+  - Nothing plays: open wallpaper-plus.log (in one of the two places above); it says why.
   - Settings window won't open: install "Microsoft Edge WebView2 Runtime" from Microsoft
     (already built into Windows 11).
   - To remove it: right-click the tray icon > Quit, turn off "Start with Windows" first if you

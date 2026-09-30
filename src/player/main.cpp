@@ -13,6 +13,7 @@
 #include "gpu.h"
 #include "log.h"
 #include "monitors.h"
+#include "paths.h"
 #include "player.h"
 #include "tray.h"
 
@@ -34,13 +35,6 @@ static const wchar_t kRunValue[] = L"WallpaperPlus";
 static constexpr UINT WM_APP_OPEN_SETTINGS = WM_APP + 40;
 
 enum TimerId : UINT_PTR { kTimerCover = 1, kTimerConfig, kTimerRebuild, kTimerHealth };
-
-static std::wstring ExeDirectory() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring s = path;
-    return s.substr(0, s.find_last_of(L'\\'));
-}
 
 static void ApplyAutostart(bool enable) {
     HKEY key;
@@ -418,11 +412,12 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
 
 int App::Run(HINSTANCE inst) {
     inst_ = inst;
-    const std::wstring dir = ExeDirectory();
+    const std::wstring dir = DataDirectory();
     configPath_ = dir + L"\\wallpaper.ini";
     statusPath_ = dir + L"\\player-status.txt";
     LogInit(dir + L"\\wallpaper-plus.log");
     Log(L"Wallpaper Plus starting");
+    if (dir != ExeDirectory()) Log(L"Can't write next to the program; keeping settings in %s", dir.c_str());
 
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -498,6 +493,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int) {
         if (HWND running = FindWindowW(kControllerClass, nullptr)) PostMessageW(running, WM_CLOSE, 0, 0);
         return 0;
     }
+
+    if (RefuseToRunFromArchive()) return 0;
 
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\WallpaperPlus.SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {

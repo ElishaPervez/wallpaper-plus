@@ -3,6 +3,7 @@
 // (WallpaperPlus.exe) picks up changes by watching wallpaper.ini.
 
 #include "bridge.h"
+#include "paths.h"
 
 #include <windows.h>
 #include <dwmapi.h>
@@ -21,13 +22,6 @@ static HWND g_hwnd = nullptr;
 static ComPtr<ICoreWebView2Controller> g_controller;
 static ComPtr<ICoreWebView2> g_webview;
 static Bridge g_bridge;
-
-static std::wstring ExeDirectory() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring s = path;
-    return s.substr(0, s.find_last_of(L'\\'));
-}
 
 static void ResizeWebView() {
     if (!g_controller) return;
@@ -182,6 +176,7 @@ static void CreateWebView(const std::wstring& exeDir) {
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
+    if (RefuseToRunFromArchive()) return 0;
     if (HWND existing = FindWindowW(kClass, nullptr)) {  // already open: bring it forward
         if (IsIconic(existing)) ShowWindow(existing, SW_RESTORE);
         SetForegroundWindow(existing);

@@ -22,7 +22,8 @@ constexpr UINT WM_APP_BRIDGE = WM_APP + 2;
 // chrome.webview.postMessage; the bridge answers {id, result} or {id, error}. Unsolicited
 // notifications go out as {event, data}.
 //
-// All state lives in files next to the exe: wallpaper.ini (read by the player), library.json
+// All state lives in files in DataDirectory() (next to the exe, unless that folder can't be
+// written): wallpaper.ini (read by the player), library.json
 // (the video library, owned by the UI), thumbs\ (thumbnail images captured by the UI) and
 // webcache\ (thumbnails and preview clips from motionbgs.com). Downloaded wallpapers go to
 // Videos\Wallpaper Plus.
@@ -47,7 +48,7 @@ private:
     HWND hwnd_ = nullptr;
     Microsoft::WRL::ComPtr<ICoreWebView2> webview_;
     Microsoft::WRL::ComPtr<ICoreWebView2_3> webview3_;
-    std::wstring exeDir_, configPath_, libraryPath_, thumbsDir_, webCacheDir_;
+    std::wstring exeDir_, dataDir_, configPath_, libraryPath_, thumbsDir_, webCacheDir_;
     web::WorkQueue fetches_{6};    // pages, thumbnails, preview clips
     web::WorkQueue downloads_{1};  // full wallpapers, one at a time
     std::map<std::string, std::shared_ptr<std::atomic<bool>>> downloadCancel_;  // by wallpaper id

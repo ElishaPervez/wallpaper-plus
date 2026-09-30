@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "monitors.h"
+#include "paths.h"
 
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -61,6 +62,21 @@ static bool WriteFileAtomic(const std::wstring& path, const std::string& bytes) 
         if (!f) return false;
     }
     return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
+// "Couldn't save settings to C:\\...\\wallpaper.ini: Access is denied." Call right after the failure.
+static std::runtime_error SaveError(const char* what, const std::wstring& path) {
+    const DWORD code = GetLastError();
+    std::string reason;
+    wchar_t* text = nullptr;
+    if (code && FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                               nullptr, code, 0, (LPWSTR)&text, 0, nullptr)) {
+        std::wstring w = text;
+        LocalFree(text);
+        while (!w.empty() && (w.back() == L'\r' || w.back() == L'\n' || w.back() == L' ')) w.pop_back();
+        reason = ": " + Utf8(w);
+    }
+    return std::runtime_error("Couldn't save " + std::string(what) + " to " + Utf8(path) + reason);
 }
 
 static std::vector<std::wstring> ScanFolder(const std::wstring& folder) {
@@ -260,10 +276,11 @@ void Bridge::Attach(HWND hwnd, ICoreWebView2* webview, const std::wstring& exeDi
     webview_ = webview;
     webview_.As(&webview3_);
     exeDir_ = exeDir;
-    configPath_ = exeDir + L"\\wallpaper.ini";
-    libraryPath_ = exeDir + L"\\library.json";
-    thumbsDir_ = exeDir + L"\\thumbs";
-    webCacheDir_ = exeDir + L"\\webcache";
+    dataDir_ = DataDirectory();  // next to the exes, or %LOCALAPPDATA%\\WallpaperPlus if that's not writable
+    configPath_ = dataDir_ + L"\\wallpaper.ini";
+    libraryPath_ = dataDir_ + L"\\library.json";
+    thumbsDir_ = dataDir_ + L"\\thumbs";
+    webCacheDir_ = dataDir_ + L"\\webcache";
     CreateDirectoryW(thumbsDir_.c_str(), nullptr);
     CreateDirectoryW(webCacheDir_.c_str(), nullptr);
     if (webview3_) {
@@ -456,11 +473,11 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
                 {"playerRunning", FindWindowW(kControllerClass, nullptr) != nullptr}};
     }
     if (cmd == "setConfig") {
-        if (!SaveConfig(configPath_, ConfigFromJson(args.at("config")))) throw std::runtime_error("Couldn't save settings");
+        if (!SaveConfig(configPath_, ConfigFromJson(args.at("config")))) throw SaveError("settings", configPath_);
         return true;
     }
     if (cmd == "saveLibrary") {
-        if (!WriteFileAtomic(libraryPath_, args.at("library").dump(1))) throw std::runtime_error("Couldn't save library");
+        if (!WriteFileAtomic(libraryPath_, args.at("library").dump(1))) throw SaveError("library", libraryPath_);
         return true;
     }
     if (cmd == "pickVideos") {
@@ -563,7 +580,7 @@ json Bridge::Handle(const std::string& cmd, const json& args) {
     if (cmd == "decoderStatus") {  // what the player says each monitor is decoding with
         json out = json::array();
         if (!FindWindowW(kControllerClass, nullptr)) return out;  // a stale file from a crash means nothing
-        std::ifstream f(exeDir_ + L"\\player-status.txt", std::ios::binary);
+        std::ifstream f(dataDir_ + L"\\player-status.txt", std::ios::binary);
         std::string line;
         while (std::getline(f, line)) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
