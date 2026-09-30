@@ -22,9 +22,8 @@ constexpr UINT WM_APP_BRIDGE = WM_APP + 2;
 // chrome.webview.postMessage; the bridge answers {id, result} or {id, error}. Unsolicited
 // notifications go out as {event, data}.
 //
-// All state lives in files in DataDirectory() (next to the exe, unless that folder can't be
-// written): wallpaper.ini (read by the player), library.json
-// (the video library, owned by the UI), thumbs\ (thumbnail images captured by the UI) and
+// All state lives in files in DataDirectory() (%APPDATA%\WallpaperPlus): wallpaper.ini (read by
+// the player), library.json (the video library, owned by the UI), thumbs\ (thumbnail images captured by the UI) and
 // webcache\ (thumbnails and preview clips from motionbgs.com). Downloaded wallpapers go to
 // Videos\Wallpaper Plus.
 //

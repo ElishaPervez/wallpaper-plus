@@ -276,7 +276,7 @@ void Bridge::Attach(HWND hwnd, ICoreWebView2* webview, const std::wstring& exeDi
     webview_ = webview;
     webview_.As(&webview3_);
     exeDir_ = exeDir;
-    dataDir_ = DataDirectory();  // next to the exes, or %LOCALAPPDATA%\\WallpaperPlus if that's not writable
+    dataDir_ = DataDirectory();  // %APPDATA%\WallpaperPlus, shared with the player
     configPath_ = dataDir_ + L"\\wallpaper.ini";
     libraryPath_ = dataDir_ + L"\\library.json";
     thumbsDir_ = dataDir_ + L"\\thumbs";

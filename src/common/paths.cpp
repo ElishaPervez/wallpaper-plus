@@ -1,6 +1,7 @@
 #include "paths.h"
 
 #include <windows.h>
+#include <shlobj.h>
 #include <cwctype>
 
 std::wstring ExeDirectory() {
@@ -26,14 +27,12 @@ static bool FileExists(const std::wstring& path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-// Creates and immediately deletes a scratch file.
-static bool CanWriteTo(const std::wstring& dir) {
-    std::wstring probe = dir + L"\\.write-test-" + std::to_wstring(GetCurrentProcessId());
-    HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;
-    CloseHandle(h);
-    return true;
+static std::wstring KnownFolder(REFKNOWNFOLDERID id) {
+    PWSTR path = nullptr;
+    std::wstring s;
+    if (SUCCEEDED(SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, nullptr, &path))) s = path;
+    CoTaskMemFree(path);
+    return s;
 }
 
 static bool UnderTemp(const std::wstring& dir) {
@@ -65,7 +64,7 @@ bool RefuseToRunFromArchive() {
     if (!RunningFromArchive()) return false;
     MessageBoxW(nullptr,
                 L"Wallpaper Plus is running from inside a zip file, from a temporary copy Windows deletes "
-                L"again, so it can't keep your settings.\n\n"
+                L"again, so it would stop working (and wouldn't start when you sign in).\n\n"
                 L"Right-click the zip, choose \"Extract All...\", then open WallpaperPlus.exe in the extracted folder.",
                 L"Wallpaper Plus", MB_ICONINFORMATION);
     return true;
@@ -80,11 +79,50 @@ static void CopyIfMissing(const std::wstring& src, const std::wstring& dst) {
     DeleteFileW(tmp.c_str());
 }
 
-// First run in %LOCALAPPDATA%: brings along the settings and library already next to the exes, so
-// they don't seem to vanish. Nothing there is overwritten. wallpaper.ini goes last: once it's
-// there, this never runs again (and Pick keeps choosing this folder).
-static void CopyInSettings(const std::wstring& from, const std::wstring& to) {
+// Folder of the exe that starts at sign in (the player writes this value, see main.cpp): where a
+// copy from before the installer, e.g. an extracted zip, kept its settings.
+static std::wstring AutostartFolder() {
+    wchar_t cmd[MAX_PATH + 3] = {};
+    DWORD size = sizeof(cmd);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"WallpaperPlus",
+                     RRF_RT_REG_SZ, nullptr, cmd, &size) != ERROR_SUCCESS)
+        return {};
+    std::wstring exe = cmd;
+    if (!exe.empty() && exe.front() == L'"') exe = exe.substr(1, exe.find(L'"', 1) - 1);
+    const size_t slash = exe.find_last_of(L'\\');
+    return slash == std::wstring::npos ? std::wstring() : exe.substr(0, slash);
+}
+
+// Where older versions kept settings: next to the exes (portable), %LOCALAPPDATA%\WallpaperPlus
+// (when that wasn't writable), or next to the exe that starts at sign in. Several can hold a
+// wallpaper.ini; the most recently saved one is the one that was in use. Empty if none.
+static std::wstring OldDataDirectory() {
+    const std::wstring local = KnownFolder(FOLDERID_LocalAppData);
+    const std::wstring candidates[] = {ExeDirectory(), local.empty() ? L"" : local + L"\\WallpaperPlus",
+                                       AutostartFolder()};
+    std::wstring best;
+    FILETIME newest{};
+    for (const auto& dir : candidates) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        if (dir.empty() || !GetFileAttributesExW((dir + L"\\wallpaper.ini").c_str(), GetFileExInfoStandard, &a) ||
+            (a.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            continue;
+        if (best.empty() || CompareFileTime(&a.ftLastWriteTime, &newest) > 0) {
+            best = dir;
+            newest = a.ftLastWriteTime;
+        }
+    }
+    return best;
+}
+
+// First run in %APPDATA%: brings along the settings and library from where an older version kept
+// them, so they don't seem to vanish. Nothing already there is overwritten. wallpaper.ini goes
+// last: once it's there, this never runs again. If both programs start at once, both copy, and
+// CopyIfMissing makes that safe.
+static void CopyInSettings(const std::wstring& to) {
     if (FileExists(to + L"\\wallpaper.ini")) return;
+    const std::wstring from = OldDataDirectory();
+    if (from.empty() || _wcsicmp(from.c_str(), to.c_str()) == 0) return;
     CopyIfMissing(from + L"\\library.json", to + L"\\library.json");
     WIN32_FIND_DATAW fd;
     HANDLE find = FindFirstFileW((from + L"\\thumbs\\*.jpg").c_str(), &fd);  // the library's thumbnails
@@ -97,25 +135,18 @@ static void CopyInSettings(const std::wstring& from, const std::wstring& to) {
     CopyIfMissing(from + L"\\wallpaper.ini", to + L"\\wallpaper.ini");
 }
 
-static std::wstring Pick() {
-    const std::wstring exeDir = ExeDirectory();
-    wchar_t local[MAX_PATH] = {};
-    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
-    const std::wstring appData = std::wstring(local) + L"\\WallpaperPlus";
-    if (!local[0]) return exeDir;
-
-    if (FileExists(exeDir + L"\\wallpaper.ini") && CanWriteTo(exeDir)) return exeDir;
-    if (FileExists(appData + L"\\wallpaper.ini")) return appData;  // chosen on an earlier run
-    if (!UnderTemp(exeDir) && CanWriteTo(exeDir)) return exeDir;
-    return appData;
-}
-
 const std::wstring& DataDirectory() {
     static const std::wstring dir = [] {
-        std::wstring d = Pick();
+        const std::wstring roaming = KnownFolder(FOLDERID_RoamingAppData);
+        if (roaming.empty()) return ExeDirectory();  // no user profile at all; nothing better to do
+        std::wstring d = roaming + L"\\WallpaperPlus";
         CreateDirectoryW(d.c_str(), nullptr);  // no-op if it exists; the parent always does
-        if (d != ExeDirectory()) CopyInSettings(ExeDirectory(), d);
+        CopyInSettings(d);
         return d;
     }();
     return dir;
+}
+
+std::wstring WebViewDataDirectory() {
+    return KnownFolder(FOLDERID_LocalAppData) + L"\\WallpaperPlus\\WebView2";
 }

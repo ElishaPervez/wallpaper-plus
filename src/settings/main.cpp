@@ -112,9 +112,7 @@ static void ApplyDarkFrame(HWND hwnd) {
 }
 
 static void CreateWebView(const std::wstring& exeDir) {
-    wchar_t localAppData[MAX_PATH];
-    GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
-    std::wstring userData = std::wstring(localAppData) + L"\\WallpaperPlus\\WebView2";
+    const std::wstring userData = WebViewDataDirectory();
 
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
         nullptr, userData.c_str(), nullptr,

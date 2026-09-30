@@ -4,18 +4,19 @@
 // Folder holding WallpaperPlus.exe, WallpaperPlusSettings.exe and ui\.
 std::wstring ExeDirectory();
 
-// Where settings, library, thumbnails, caches, status and the log live. Both programs must land
-// on the same answer, so it only depends on what's on disk:
-//  - next to the exes (portable) when that folder already has a wallpaper.ini, or can be written;
-//  - otherwise %LOCALAPPDATA%\WallpaperPlus. That covers folders the user can't write to (Program
-//    Files, drive roots) and Windows Security's "Controlled folder access", which silently stops
-//    unsigned programs writing into Documents and Desktop. The first time, settings and library
-//    already next to the exes are copied there.
-// Computed once per process; the folder exists on return.
+// Where settings, library, thumbnails, caches, status and the log live: always
+// %APPDATA%\WallpaperPlus, wherever the exes are, so both programs agree and an installed copy in
+// Program Files (which the user can't write to) works like any other.
+// The first time, settings, library and thumbnails from where older versions kept them are copied
+// in (see paths.cpp). Computed once per process; the folder exists on return.
 const std::wstring& DataDirectory();
 
+// %LOCALAPPDATA%\WallpaperPlus\WebView2: the settings window's browser cache. Kept out of
+// DataDirectory() because it's cache, and a roaming profile shouldn't carry it around.
+std::wstring WebViewDataDirectory();
+
 // True if Windows (or 7-Zip / WinRAR) is running the exe straight out of a zip, from a temporary
-// copy it will delete. Settings would vanish and "start with Windows" would point at nothing.
+// copy it will delete: "start at sign in" would point at a file that's about to vanish.
 bool RunningFromArchive();
 
 // Tells the user to extract the zip first. Returns true if it did (the caller should exit).

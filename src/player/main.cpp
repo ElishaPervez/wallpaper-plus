@@ -417,7 +417,7 @@ int App::Run(HINSTANCE inst) {
     statusPath_ = dir + L"\\player-status.txt";
     LogInit(dir + L"\\wallpaper-plus.log");
     Log(L"Wallpaper Plus starting");
-    if (dir != ExeDirectory()) Log(L"Can't write next to the program; keeping settings in %s", dir.c_str());
+    Log(L"Settings folder: %s", dir.c_str());
 
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -453,7 +453,7 @@ int App::Run(HINSTANCE inst) {
     for (const auto& [n, m] : config_.perMonitor) anyVideo = anyVideo || !m.videos.empty();
     if (!anyVideo) OpenSettingsWindow();  // first run: go straight to picking a wallpaper
 
-    // Watch the exe folder for saves to wallpaper.ini.
+    // Watch the settings folder for saves to wallpaper.ini.
     HANDLE watch = FindFirstChangeNotificationW(dir.c_str(), FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
 
     MSG msg;
